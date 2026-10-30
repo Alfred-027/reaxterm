@@ -1,0 +1,97 @@
+# Compila ReaXTerm en Windows y lo firma con SignPath en dos etapas:
+#   1. ReaXTerm.exe (la aplicación, que va dentro del instalador y del portable)
+#   2. El instalador y el portable, armados con la aplicación ya firmada
+# Se ejecuta al publicar una etiqueta v* (crea la Release) o a mano desde la pestaña Actions.
+#
+# Configuración necesaria en GitHub (Settings › Secrets and variables › Actions):
+#   secreto   SIGNPATH_API_TOKEN        token de un usuario CI de SignPath
+#   variable  SIGNPATH_ORGANIZATION_ID  id de la organización en SignPath
+name: Compilar y firmar
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  RX_SIGNED: '1'
+  SIGNPATH_PROJECT: reaxterm
+  SIGNPATH_POLICY: release-signing
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Empaquetar la aplicación (sin instalador)
+        run: npx electron-builder --win --dir -c.win.signAndEditExecutable=true
+
+      - name: Subir la aplicación sin firmar
+        id: app
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-sin-firmar
+          path: dist/win-unpacked/
+
+      - name: Firmar ReaXTerm.exe con SignPath
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ env.SIGNPATH_PROJECT }}
+          signing-policy-slug: ${{ env.SIGNPATH_POLICY }}
+          artifact-configuration-slug: app
+          github-artifact-id: ${{ steps.app.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: dist/app-firmada
+
+      - name: Generar instalador y portable con la aplicación firmada
+        run: npx electron-builder --win portable nsis --prepackaged dist/app-firmada
+
+      - name: Subir instalador y portable sin firmar
+        id: installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: instaladores-sin-firmar
+          path: |
+            dist/ReaXTerm Setup *.exe
+            dist/ReaXTerm-Portable-*.exe
+
+      - name: Firmar instalador y portable con SignPath
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ env.SIGNPATH_PROJECT }}
+          signing-policy-slug: ${{ env.SIGNPATH_POLICY }}
+          artifact-configuration-slug: installers
+          github-artifact-id: ${{ steps.installers.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: dist/firmados
+
+      - name: Guardar los ejecutables firmados
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReaXTerm-firmado
+          path: dist/firmados/
+
+      - name: Publicar la Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/firmados/*.exe
+          generate_release_notes: true

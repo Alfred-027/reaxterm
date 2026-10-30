@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SignPath › proyecto reaxterm › Artifact configuration con slug «app».
+     Recibe el contenido de dist/win-unpacked y firma sólo el ejecutable de ReaXTerm. -->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <pe-file path="ReaXTerm.exe">
+      <authenticode-sign />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>

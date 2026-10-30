@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="es" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'; font-src 'self' data:">
+  <title>ReaXTerm</title>
+  <link rel="stylesheet" href="../node_modules/@xterm/xterm/css/xterm.css">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="titlebar">
+    <div class="brand">
+      <img src="../assets/logo.svg" alt="" class="brand-logo">
+      <span class="brand-name">Rea<b>X</b>Term</span>
+    </div>
+    <div class="quick">
+      <span class="quick-ic" id="quickIcon"></span>
+      <input id="quickInput" spellcheck="false" placeholder="Conexión rápida: usuario@servidor:22  ·  telnet host  ·  rdp host  ·  o busca una sesión">
+      <kbd>Ctrl+Shift+P</kbd>
+      <div class="quick-list" id="quickList"></div>
+    </div>
+    <div class="title-actions" id="titleActions"></div>
+  </header>
+
+  <div class="main">
+    <nav class="rail" id="rail"></nav>
+    <aside class="side" id="side">
+      <div class="side-inner" id="sideInner"></div>
+      <div class="side-resizer" id="sideResizer"></div>
+    </aside>
+    <section class="workspace">
+      <div class="tabbar" id="tabbar">
+        <div class="tabs" id="tabs"></div>
+        <button class="tab-add" id="tabAdd" title="Nueva terminal local (Ctrl+Shift+T)"></button>
+      </div>
+      <div class="terms" id="terms"></div>
+      <div class="welcome" id="welcome"></div>
+    </section>
+  </div>
+
+  <footer class="statusbar" id="statusbar"></footer>
+  <div id="overlays"></div>
+
+  <script src="../node_modules/@xterm/xterm/lib/xterm.js"></script>
+  <script src="../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
+  <script src="../node_modules/@xterm/addon-search/lib/addon-search.js"></script>
+  <script src="../node_modules/@xterm/addon-web-links/lib/addon-web-links.js"></script>
+  <script src="../node_modules/@xterm/addon-unicode11/lib/addon-unicode11.js"></script>
+  <script src="../node_modules/@xterm/addon-webgl/lib/addon-webgl.js"></script>
+  <script src="icons.js"></script>
+  <script src="themes.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

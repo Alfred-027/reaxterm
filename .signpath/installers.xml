@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SignPath › proyecto reaxterm › Artifact configuration con slug «installers».
+     Firma el instalador y la versión portable. -->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <pe-file path="ReaXTerm Setup *.exe">
+      <authenticode-sign />
+    </pe-file>
+    <pe-file path="ReaXTerm-Portable-*.exe">
+      <authenticode-sign />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>
