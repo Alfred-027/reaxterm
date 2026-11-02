@@ -2,7 +2,7 @@
 <html lang="es" data-theme="dark">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'; font-src 'self' data:">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' data: ws://127.0.0.1:*; font-src 'self' data:">
   <title>ReaXTerm</title>
   <link rel="stylesheet" href="../node_modules/@xterm/xterm/css/xterm.css">
   <link rel="stylesheet" href="styles.css">
@@ -50,5 +50,6 @@
   <script src="icons.js"></script>
   <script src="themes.js"></script>
   <script src="app.js"></script>
+  <script type="module" src="rdp.js"></script>
 </body>
 </html>

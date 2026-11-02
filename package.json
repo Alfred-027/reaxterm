@@ -1,7 +1,7 @@
 {
   "name": "reaxterm",
   "productName": "ReaXTerm",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "ReaXTerm - Terminal moderno con SSH, SFTP, FTP, Telnet, RDP, puerto serie, túneles y multi-ejecución",
   "main": "main.js",
   "author": "Alfredo Garrido",
@@ -59,6 +59,8 @@
     "afterPack": "build/afterPack.js"
   },
   "dependencies": {
+    "@devolutions/iron-remote-desktop": "^0.11.0",
+    "@devolutions/iron-remote-desktop-rdp": "^0.7.0",
     "@lydell/node-pty": "^1.2.0-beta.18",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-search": "^0.16.0",
@@ -69,7 +71,8 @@
     "basic-ftp": "^6.2.3",
     "exceljs": "^4.4.0",
     "serialport": "^13.0.0",
-    "ssh2": "^1.17.0"
+    "ssh2": "^1.17.0",
+    "ws": "^8.22.0"
   },
   "devDependencies": {
     "electron": "^45.1.0",

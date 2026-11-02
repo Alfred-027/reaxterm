@@ -39,6 +39,13 @@ const fmtSize = (n) => {
   return n.toFixed(n < 10 ? 1 : 0) + ' ' + u[i];
 };
 const fmtDate = (ms) => new Date(ms).toLocaleString('es', { dateStyle: 'short', timeStyle: 'short' });
+const fmtAgo = (ms) => {
+  const min = Math.round((Date.now() - (ms || 0)) / 60000);
+  if (min < 1) return 'hace un momento';
+  if (min < 60) return `hace ${min} min`;
+  if (min < 24 * 60) return `hace ${Math.round(min / 60)} h`;
+  return fmtDate(ms);
+};
 const fmtDur = (ms) => {
   const s = Math.floor(ms / 1000);
   return [Math.floor(s / 3600), Math.floor((s % 3600) / 60), s % 60].map((v) => String(v).padStart(2, '0')).join(':');
@@ -60,13 +67,14 @@ const TYPES = {
 };
 const DEFAULT_PORTS = { ssh: 22, sftp: 22, telnet: 23, rdp: 3389, ftp: 21 };
 const isFilesType = (type) => type === 'sftp' || type === 'ftp';
+const noTerminal = (type) => isFilesType(type) || type === 'rdp';
 const BAUD_RATES = [300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600];
 const FOLDER_ICONS = ['folder', 'server', 'monitor', 'globe', 'cloud', 'database', 'shield', 'lock', 'briefcase', 'home', 'cpu', 'wifi', 'terminal', 'code', 'tool', 'star', 'flag', 'activity'];
 const DEFAULT_SETTINGS = {
   appTheme: 'dark', accent: '#4f8cff', fontFamily: "'Cascadia Mono', 'Cascadia Code', Consolas, monospace", fontSize: 14,
   lineHeight: 1.15, termTheme: 'reax', cursorStyle: 'bar', cursorBlink: true, scrollback: 10000, copyOnSelect: true,
   rightClickPaste: false, confirmClose: true, autoSftp: true, defaultShell: 'powershell', sidebarWidth: 290,
-  sidebarOpen: true, openFolders: {}, folderStyles: {}, compactSessions: true, sftpHidden: false, sftpFollow: false, webgl: true, pasteWarnLines: 5,
+  sidebarOpen: true, openFolders: {}, folderStyles: {}, compactSessions: true, rdpMode: 'mstsc', sftpHidden: false, sftpFollow: false, webgl: true, pasteWarnLines: 5,
 };
 const DEFAULT_SNIPPETS = [
   ['Información del sistema', 'uname -a && cat /etc/os-release | head -n 4 && uptime'],
@@ -244,11 +252,13 @@ function sessionTitle(s) {
   return (s.user ? s.user + '@' : '') + s.host;
 }
 
-function openSession(s) {
-  if (s.type === 'rdp') return launchRdp(s);
+function openSession(s, opts = {}) {
+  if (s.type === 'rdp' && !(opts.rdpTab ?? S().rdpMode === 'tab')) return launchRdp(s);
   if (s.id) {
     D.recent = [s.id, ...D.recent.filter((r) => r !== s.id)].slice(0, 8);
     save('recent');
+    const cur = D.sessions.find((x) => x.id === s.id);
+    if (cur && cur.quick) { cur.lastUsed = Date.now(); save('sessions'); }
   }
   const id = uid();
   const termEl = h('div', { class: 'pane-term' });
@@ -262,8 +272,19 @@ function openSession(s) {
       h('button', { class: 'icon-btn sm', title: 'Cerrar', onclick: (e) => { e.stopPropagation(); closeTab(id); } }, icon('x', 13))),
     termEl, searchBox,
     isFilesType(s.type) && h('div', { class: 'pane-files' }),
+    s.type === 'rdp' && h('div', { class: 'pane-rdp' }),
     h('div', { class: 'drop-hint' }, icon('upload', 22), 'Suelta para subir al directorio SFTP actual'));
   if (isFilesType(s.type)) pane.classList.add('files');
+  if (s.type === 'rdp') {
+    pane.classList.add('rdp');
+    const rb = pane.querySelector('.pane-rdp');
+    rb.tabIndex = 0;
+    rb.addEventListener('keydown', (e) => {
+      if (t.state !== 'closed') return;
+      if (e.key === 'r' || e.key === 'R') connectRdp(t);
+      else if (e.key === 'Enter') closeTab(t.id, { force: true });
+    });
+  }
   $('#terms').append(pane);
 
   const term = new Terminal({
@@ -282,7 +303,7 @@ function openSession(s) {
 
   const t = {
     id, session: { ...s }, term, fit, search, el: pane, state: 'connecting', statusText: 'Conectando…',
-    startedAt: null, title: sessionTitle(s), logging: null, multi: !isFilesType(s.type), opened: false,
+    startedAt: null, title: sessionTitle(s), logging: null, multi: !noTerminal(s.type), opened: false,
   };
   // El shell remoto informa su directorio con OSC 7337 (ReaXTerm) u OSC 7 (estándar): es invisible
   const onCwd = (dir) => {
@@ -404,6 +425,7 @@ function fitTab(t) {
 }
 
 async function connectTab(t) {
+  if (t.session.type === 'rdp') return connectRdp(t);
   t.state = 'connecting';
   t.statusText = 'Conectando…';
   renderAll();
@@ -427,6 +449,205 @@ async function reconnect(t) {
   await api('term:close', t.id).catch(() => {});
   t.term.write('\r\n');
   connectTab(t);
+}
+
+// ------------------------------------------------------------ RDP en pestaña (IronRDP en WebAssembly)
+const RDP_ERRORS = {
+  1: 'Usuario o contraseña incorrectos',
+  2: 'El servidor rechazó el inicio de sesión',
+  3: 'Acceso denegado',
+  4: 'No se pudo establecer la conexión con el servidor',
+  5: 'No se pudo conectar con el puente RDP interno',
+  6: 'El servidor no aceptó la negociación de seguridad (puede exigir un modo que este cliente no soporta)',
+};
+// Códigos de error del puente RDCleanPath (src/rdpproxy.js)
+const RDCP_ERRORS = {
+  103: 'No se pudo conectar al servidor. Revisa que esté encendido, que la dirección sea correcta y que el puerto RDP esté abierto.',
+  104: 'No se pudo resolver el nombre del servidor.',
+  105: 'Falló el cifrado TLS con el servidor.',
+};
+function rdpErrorText(e) {
+  if (e && typeof e.kind === 'function') {
+    const base = RDP_ERRORS[e.kind()] || 'Error de RDP';
+    let detail = '';
+    try { detail = String(e.backtrace()).split('\n')[0]; } catch { /* sin detalle */ }
+    const code = Number((detail.match(/code (\d+)/) || [])[1]);
+    if (e.kind() === 4 && RDCP_ERRORS[code]) return RDCP_ERRORS[code];
+    if (e.kind() === 4 && /code 1\b/.test(detail)) return 'La conexión fue rechazada (certificado no aceptado o sesión caducada). Intenta de nuevo.';
+    return detail && e.kind() !== 1 ? `${base}: ${detail}` : base;
+  }
+  return (e && e.message) || String(e);
+}
+
+function waitRdpModule() {
+  if (window.RxRdp) return window.RxRdp.load();
+  return new Promise((resolve) => window.addEventListener('rxrdp-loaded', () => resolve(window.RxRdp.load()), { once: true }));
+}
+
+function rdpMessage(t, iconName, text, actions) {
+  t.el.querySelector('.pane-rdp').replaceChildren(h('div', { class: 'rdp-msg' }, icon(iconName, 30), h('div', {}, text), actions));
+}
+
+function rdpClosed(t, reason) {
+  if (!tabs.has(t.id)) return;
+  if (t.rdp) { try { t.rdp.ui.shutdown(); } catch { /* ya cerrada */ } }
+  t.rdp = null;
+  t.state = 'closed';
+  t.statusText = reason;
+  rdpMessage(t, 'monitor', reason, h('div', { class: 'row-inline', style: { justifyContent: 'center', marginTop: '6px' } },
+    h('button', { class: 'btn primary sm', onclick: () => connectRdp(t) }, icon('refresh', 14), 'Reconectar (R)'),
+    h('button', { class: 'btn sm', onclick: () => launchRdp(t.session) }, icon('export', 14), 'Abrir con Escritorio remoto de Windows'),
+    h('button', { class: 'btn sm', onclick: () => closeTab(t.id, { force: true }) }, icon('x', 14), 'Cerrar pestaña (Enter)')));
+  renderAll();
+}
+
+const rdpDim = (n) => Math.floor(n / 8) * 8;
+
+// opts.resize: reconexión para tomar el nuevo tamaño de la pestaña (servidores sin cambio de resolución en
+// caliente, como hace mstsc); reutiliza el usuario y la contraseña de la conexión anterior, sin preguntar.
+async function connectRdp(t, opts = {}) {
+  const s = t.session;
+  const gen = t.rdpGen = (t.rdpGen || 0) + 1; // una conexión anterior que termine no debe cerrar esta
+  if (t.rdp) { try { t.rdp.ui.shutdown(); } catch { /* ignore */ } t.rdp = null; }
+  t.state = 'connecting';
+  t.statusText = opts.resize ? 'Ajustando la resolución…' : 'Conectando…';
+  rdpMessage(t, 'monitor', opts.resize ? 'Ajustando la resolución del escritorio remoto…' : `Conectando a ${s.host}:${s.port || 3389}…`);
+  renderAll();
+  try {
+    const R = await waitRdpModule();
+    const prep = opts.resize && t.rdpAuth
+      ? { ...t.rdpAuth, ...(await api('launch:rdpPrepare', s, { ticketOnly: true })) }
+      : await api('launch:rdpPrepare', s);
+    if (!tabs.has(t.id) || gen !== t.rdpGen) return;
+    const box = t.el.querySelector('.pane-rdp');
+    const el = document.createElement('iron-remote-desktop');
+    el.module = R.Backend;
+    el.setAttribute('scale', 'fit');
+    el.setAttribute('flexcenter', 'true');
+    el.setAttribute('verbose', 'false');
+    const ui = await new Promise((resolve) => {
+      el.addEventListener('ready', (e) => resolve(e.detail.irgUserInteraction), { once: true });
+      box.replaceChildren(el);
+    });
+    // El «fit» de IronRDP mide contra la ventana completa (no contra la pestaña) y se sale por abajo:
+    // el lienzo se ajusta aquí al contenedor, manteniendo la proporción
+    const fit = document.createElement('style');
+    fit.textContent = `.screen-viewer, .screen-wrapper { width: 100% !important; height: 100% !important; max-width: none !important; max-height: none !important; overflow: hidden !important; }
+      .screen-wrapper { display: flex !important; align-items: center; justify-content: center; }
+      canvas { width: auto !important; height: auto !important; min-width: 0 !important; min-height: 0 !important; max-width: 100% !important; max-height: 100% !important; }`;
+    if (el.shadowRoot) el.shadowRoot.append(fit);
+    const r = box.getBoundingClientRect();
+    // los servidores Windows antiguos redondean el ancho a múltiplo de 4; si no calza, la imagen sale inclinada
+    const size = { width: rdpDim(Math.max(800, r.width)), height: rdpDim(Math.max(600, r.height)) };
+    let cb = ui.configBuilder().withDestination(prep.destination).withProxyAddress(prep.proxyAddress).withAuthToken(prep.token)
+      .withUsername(prep.user).withPassword(prep.password).withDesktopSize(size).withExtension(R.displayControl(true));
+    if (prep.domain) cb = cb.withServerDomain(prep.domain);
+    const info = await ui.connect(cb.build());
+    if (!tabs.has(t.id) || gen !== t.rdpGen) { ui.shutdown(); return; }
+    t.rdp = { ui, el, token: prep.token, size };
+    t.rdpAuth = { user: prep.user, domain: prep.domain, password: prep.password, destination: prep.destination };
+    rdpObserve(t, box);
+    for (const kind of rdpEvents.get(prep.token) || []) rdpCapability(t, kind);
+    rdpEvents.delete(prep.token);
+    // Windows intercepta la tecla Windows y Ctrl+Alt+Supr antes que la app: se envían con estos botones
+    const send = (fn) => (e) => { e.preventDefault(); try { fn(); } catch { /* ignore */ } el.focus(); };
+    box.append(h('div', { class: 'rdp-bar' },
+      h('button', { title: 'Enviar la tecla Windows al equipo remoto', onmousedown: send(() => ui.metaKey()) }, '⊞ Win'),
+      h('button', { title: 'Enviar Ctrl+Alt+Supr al equipo remoto', onmousedown: send(() => ui.ctrlAltDel()) }, 'Ctrl+Alt+Supr')));
+    ui.setVisibility(true);
+    ui.setEnableClipboard(true);
+    t.state = 'connected';
+    t.startedAt = Date.now();
+    t.statusText = `rdp ${prep.domain ? prep.domain + '\\' : ''}${prep.user}@${prep.destination}`;
+    if (prep.prepId) api('launch:rdpConnected', prep.prepId);
+    renderAll();
+    if (activeId === t.id) el.focus();
+    info.run().then(
+      (end) => { if (gen === t.rdpGen) rdpClosed(t, `Sesión RDP finalizada${end && end.reason ? ': ' + end.reason() : ''}`); },
+      (e) => { if (gen === t.rdpGen) rdpClosed(t, rdpErrorText(e)); });
+  } catch (e) {
+    if (gen === t.rdpGen) rdpClosed(t, rdpErrorText(e));
+  }
+}
+
+// Al cambiar el tamaño de la pestaña: si el servidor soporta cambiar la resolución en caliente (canal
+// DisplayControl, Windows 8.1 / 2012 R2 o superior) se le pide; si no, se reconecta con el tamaño nuevo
+// cuando se deja de redimensionar (Windows vuelve a la misma sesión).
+function rdpObserve(t, box) {
+  if (t.rdpObserver) return;
+  t.rdpObserver = new ResizeObserver(debounce(() => {
+    if (!t.rdp || t.state !== 'connected') return;
+    const b = box.getBoundingClientRect();
+    const w = rdpDim(Math.max(800, b.width)), hh = rdpDim(Math.max(600, b.height));
+    if (b.width < 200 || b.height < 150 || (w === t.rdp.size.width && hh === t.rdp.size.height)) return;
+    if (t.rdp.dynamic) {
+      t.rdp.size = { width: w, height: hh };
+      try { t.rdp.ui.resize(w, hh); } catch { /* ignore */ }
+    } else {
+      connectRdp(t, { resize: true });
+    }
+  }, 900));
+  t.rdpObserver.observe(box);
+}
+
+// ---- teclado en sesiones RDP
+// Con el foco en una sesión RDP, los atajos de ReaXTerm no se aplican (todo va al equipo remoto) y el proceso
+// principal captura las teclas que Windows procesa antes que la app (src/keyhook.js); llegan aquí y se
+// entregan a IronRDP como eventos de teclado.
+const rdpFocused = () => !!document.activeElement && document.activeElement.tagName === 'IRON-REMOTE-DESKTOP';
+let rdpKeysOn = false;
+function syncRdpKeys() {
+  const on = document.hasFocus() && rdpFocused();
+  if (on !== rdpKeysOn) { rdpKeysOn = on; api('launch:rdpKeys', on).catch(() => {}); }
+}
+for (const ev of ['focusin', 'focusout']) document.addEventListener(ev, () => setTimeout(syncRdpKeys, 0));
+window.addEventListener('focus', syncRdpKeys);
+window.addEventListener('blur', syncRdpKeys);
+
+const VK_CODES = {
+  0x08: 'Backspace', 0x09: 'Tab', 0x0D: 'Enter', 0x1B: 'Escape', 0x20: 'Space', 0x21: 'PageUp', 0x22: 'PageDown', 0x23: 'End', 0x24: 'Home',
+  0x25: 'ArrowLeft', 0x26: 'ArrowUp', 0x27: 'ArrowRight', 0x28: 'ArrowDown', 0x2C: 'PrintScreen', 0x2D: 'Insert', 0x2E: 'Delete',
+  0x5B: 'MetaLeft', 0x5C: 'MetaRight', 0x5D: 'ContextMenu', 0xA0: 'ShiftLeft', 0xA1: 'ShiftRight', 0xA2: 'ControlLeft', 0xA3: 'ControlRight',
+  0xA4: 'AltLeft', 0xA5: 'AltRight', 0xBA: 'Semicolon', 0xBB: 'Equal', 0xBC: 'Comma', 0xBD: 'Minus', 0xBE: 'Period', 0xBF: 'Slash',
+  0xC0: 'Backquote', 0xDB: 'BracketLeft', 0xDC: 'Backslash', 0xDD: 'BracketRight', 0xDE: 'Quote', 0xE2: 'IntlBackslash',
+};
+function vkToCode(vk) {
+  if (vk >= 0x41 && vk <= 0x5A) return 'Key' + String.fromCharCode(vk);
+  if (vk >= 0x30 && vk <= 0x39) return 'Digit' + (vk - 0x30);
+  if (vk >= 0x60 && vk <= 0x69) return 'Numpad' + (vk - 0x60);
+  if (vk >= 0x70 && vk <= 0x87) return 'F' + (vk - 0x6F);
+  return VK_CODES[vk] || null;
+}
+rx.on('launch:rdpKey', (type, vk) => {
+  const code = vkToCode(vk);
+  if (!code || !rdpFocused()) return;
+  const key = /^Meta/.test(code) ? 'Meta' : /^Key/.test(code) ? code.slice(3).toLowerCase() : code;
+  window.dispatchEvent(new KeyboardEvent(type, { code, key, bubbles: true, cancelable: true }));
+});
+
+// Capacidades del servidor que detecta el puente (src/rdpproxy.js). Pueden llegar antes que connect() termine.
+const rdpEvents = new Map(); // token -> Set
+rx.on('launch:rdpEvent', (token, kind) => {
+  const t = [...tabs.values()].find((x) => x.rdp && x.rdp.token === token);
+  if (t) return rdpCapability(t, kind);
+  if (!rdpEvents.has(token)) rdpEvents.set(token, new Set());
+  rdpEvents.get(token).add(kind);
+});
+
+function rdpCapability(t, kind) {
+  const box = t.el.querySelector('.pane-rdp');
+  if (kind === 'displayControl') {
+    // Sólo con este canal el servidor acepta cambiar la resolución en caliente; sin él, el escritorio se escala
+    // (los servidores antiguos lo ignoran y la imagen queda en negro)
+    t.rdp.dynamic = true;
+  } else if (kind === 'orders' && !box.querySelector('.rdp-warn')) {
+    const warn = h('div', { class: 'rdp-warn' },
+      icon('alert', 16),
+      h('span', {}, 'Este servidor es un Windows antiguo que dibuja con órdenes GDI, que la pestaña integrada no soporta: parte de la pantalla puede quedar en negro.'),
+      h('button', { class: 'btn primary sm', onclick: () => launchRdp(t.session) }, icon('export', 14), 'Abrir con Escritorio remoto de Windows'),
+      h('button', { class: 'btn sm', title: 'Ocultar', onclick: () => warn.remove() }, icon('x', 14)));
+    box.append(warn);
+  }
 }
 
 rx.on('term:data', (id, d) => {
@@ -522,6 +743,7 @@ async function closeTab(id, { force = false } = {}) {
     if (!ok) return;
   }
   api('term:close', id).catch(() => {});
+  if (t.rdp) { try { t.rdp.ui.shutdown(); } catch { /* ya cerrada */ } }
   t.term.dispose();
   t.el.remove();
   tabs.delete(id);
@@ -537,7 +759,7 @@ function activate(id) {
   const t = tabs.get(id);
   if (t) { t.bell = false; }
   renderAll();
-  if (t) requestAnimationFrame(() => { if (!t.opened || isFilesType(t.session.type)) return; fitTab(t); if (!document.activeElement || !document.activeElement.closest('.modal, .side, .quick')) t.term.focus(); });
+  if (t) requestAnimationFrame(() => { if (!t.opened || noTerminal(t.session.type)) { if (t.rdp) t.rdp.el.focus(); return; } fitTab(t); if (!document.activeElement || !document.activeElement.closest('.modal, .side, .quick')) t.term.focus(); });
 }
 
 function cycleTab(dir) {
@@ -856,26 +1078,33 @@ function moveFolder(from, to) {
   return true;
 }
 
-// Soltar una sesión o carpeta arrastrada en la carpeta «target» ('' = raíz)
+// Deja la sesión en la carpeta «folder» de «Mis sesiones»: si era una conexión rápida pasa a ser guardada
+function keepSession(s, folder) {
+  s.folder = folder;
+  delete s.quick;
+  delete s.lastUsed;
+}
+
+// Soltar una sesión o carpeta arrastrada en la carpeta «target» ('' = raíz de «Mis sesiones»)
 function dropInto(e, target) {
   const sid = e.dataTransfer.getData(DRAG_SESSION);
   const fpath = e.dataTransfer.getData(DRAG_FOLDER);
   if (sid) {
     const ids = sid.split(',');
-    const list = D.sessions.filter((x) => ids.includes(x.id) && (x.folder || '') !== target);
+    const list = D.sessions.filter((x) => ids.includes(x.id) && ((x.folder || '') !== target || x.quick));
     if (!list.length) return;
-    list.forEach((s) => { s.folder = target; });
+    list.forEach((s) => keepSession(s, target));
     if (target) S().openFolders[target] = true;
     save('sessions'); save('settings');
     const what = list.length === 1 ? `«${list[0].name || list[0].host || sessionTitle(list[0])}» movida` : `${list.length} sesiones movidas`;
-    toast(`${what} a ${target || 'la raíz'}`, 'ok', 1800);
+    toast(`${what} a ${target || 'Mis sesiones'}`, 'ok', 1800);
   } else if (fpath) {
     const name = fpath.split('/').pop();
     const to = target ? `${target}/${name}` : name;
     if (to === fpath || target === fpath || target.startsWith(fpath + '/')) return;
     if (D.sessions.some((x) => inFolder(x, to))) return toast(`Ya existe la carpeta «${to}»`, 'warn');
     moveFolder(fpath, to);
-    toast(`Carpeta movida a ${target || 'la raíz'}`, 'ok', 1800);
+    toast(`Carpeta movida a ${target || 'Mis sesiones'}`, 'ok', 1800);
   } else return;
   renderSide();
 }
@@ -918,6 +1147,9 @@ function sessionRow(s, withActions = true, depth = 0) {
   const sub = s.type === 'local' ? (s.wslDistro ? `WSL · ${s.wslDistro}` : (INFO.shells.find((x) => x.id === s.shell) || { label: s.shell }).label)
     : s.type === 'serial' ? `${s.serialPort || '?'} · ${s.baud || 9600} baudios`
     : `${isFilesType(s.type) ? s.type + '://' : ''}${u ? u + '@' : ''}${s.host}${s.port ? ':' + s.port : ''}`;
+  // conexión rápida sin nombre: la dirección es el nombre y debajo va el tipo y cuándo se usó
+  const info = s.quick && !s.name ? `${s.type === 'telnet' ? 'Telnet' : s.type.toUpperCase()} · ${fmtAgo(s.lastUsed)}` : sub;
+  const keyed = credOf(s) || (s.quick && s.passwordEnc);
   const compact = S().compactSessions && withActions;
   if (withActions) sessVisible.push(s.id);
   const row = h('div', {
@@ -940,11 +1172,11 @@ function sessionRow(s, withActions = true, depth = 0) {
       const many = withActions && sessSel.size > 1;
       showMenu(e.clientX, e.clientY, many ? multiSessionMenu() : sessionMenu(s));
     },
-    onmouseenter: compact ? (e) => showHoverTip(e.currentTarget, s, sub) : null,
+    onmouseenter: compact ? (e) => showHoverTip(e.currentTarget, s, info) : null,
     onmouseleave: compact ? hideHoverTip : null,
   },
   h('div', { class: 'sess-ic' }, icon(TYPES[s.type].icon, compact ? 15 : 16), s.color && h('span', { class: 'tag', style: { background: s.color } })),
-  h('div', { class: 'meta' }, h('div', { class: 'name' }, s.name || sub), !compact && h('div', { class: 'sub' }, credOf(s) ? icon('key', 11) : null, sub)),
+  h('div', { class: 'meta' }, h('div', { class: 'name' }, s.name || sub), !compact && h('div', { class: 'sub' }, keyed ? icon('key', 11) : null, info)),
   withActions && h('div', { class: 'acts' },
     h('button', { class: 'icon-btn sm', title: 'Conectar', onclick: () => openSession(s) }, icon('play', 13)),
     h('button', { class: 'icon-btn sm' + (s.favorite ? ' fav' : ''), title: 'Favorito', onclick: () => { s.favorite = !s.favorite; save('sessions'); renderAll(); } }, icon('star', 13)),
@@ -994,12 +1226,46 @@ function multiSessionMenu() {
       const to = await promptText('Mover a carpeta', 'Carpeta de destino (vacío = raíz), p. ej. Clientes/ACME', list[0].folder || '');
       if (to == null) return;
       const target = to.trim().replace(/^\/+|\/+$/g, '');
-      list.forEach((s) => { s.folder = target; });
+      list.forEach((s) => keepSession(s, target));
       save('sessions'); renderSide();
     } },
     { sep: true },
     { label: `Eliminar ${list.length} sesiones`, icon: 'trash', danger: true, hint: 'Supr', action: () => deleteSessions(list.map((s) => s.id)) },
   ];
+}
+
+// F2: renombrar la sesión en la misma fila (Enter guarda, Esc cancela; vacío = usar la dirección)
+function renameInline(id) {
+  const s = D.sessions.find((x) => x.id === id);
+  const row = document.querySelector(`#sideInner .sess[data-sid="${CSS.escape(id)}"]`);
+  if (!s || !row) return;
+  hideHoverTip();
+  const input = h('input', { class: 'rename', value: s.name || '', placeholder: sessionTitle({ ...s, name: '' }), spellcheck: 'false' });
+  row.draggable = false;
+  row.querySelector('.name').replaceChildren(input);
+  let done = false;
+  // un clic fuera del campo guarda (el «blur» no siempre llega, p. ej. con la ventana sin foco)
+  const away = (e) => { if (e.target !== input) finish(true); };
+  const finish = (ok) => {
+    if (done) return;
+    done = true;
+    document.removeEventListener('mousedown', away, true);
+    const name = input.value.trim();
+    if (ok && name !== (s.name || '')) { s.name = name; save('sessions'); }
+    renderAll();
+    const body = $('#sideInner .side-body');
+    if (body) body.focus({ preventScroll: true });
+  };
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  });
+  input.addEventListener('blur', () => finish(true));
+  for (const ev of ['click', 'dblclick', 'mousedown']) input.addEventListener(ev, (e) => e.stopPropagation());
+  setTimeout(() => document.addEventListener('mousedown', away, true), 0);
+  input.focus();
+  input.select();
 }
 
 // Tarjeta flotante con usuario@servidor en la vista compacta
@@ -1025,11 +1291,16 @@ function hideHoverTip() { clearTimeout(hoverTimer); const t = $('#hoverTip'); if
 function sessionMenu(s) {
   return [
     { label: 'Conectar', icon: 'play', action: () => openSession(s) },
+    s.type === 'rdp' && (S().rdpMode === 'tab'
+      ? { label: 'Abrir con Escritorio remoto de Windows', icon: 'export', action: () => launchRdp(s) }
+      : { label: 'Abrir en pestaña (integrado)', icon: 'monitor', action: () => openSession(s, { rdpTab: true }) }),
     s.type === 'ssh' && { label: 'Abrir como túnel SOCKS…', icon: 'tunnel', action: () => editTunnel({ sessionId: s.id, kind: 'dynamic', listenPort: 1080 }) },
     { label: s.favorite ? 'Quitar de favoritos' : 'Añadir a favoritos', icon: 'star', action: () => { s.favorite = !s.favorite; save('sessions'); renderAll(); } },
     { sep: true },
+    s.quick && { label: 'Guardar en Mis sesiones…', icon: 'folder', action: () => editSession(s, { title: 'Guardar en Mis sesiones', keep: true }) },
     { label: 'Editar…', icon: 'edit', action: () => editSession(s) },
-    { label: 'Duplicar…', icon: 'copy', action: () => editSession({ ...s, id: undefined, favorite: false, name: (s.name || s.host || sessionTitle(s)) + ' (copia)' }, { title: 'Duplicar sesión' }) },
+    { label: 'Cambiar nombre', icon: 'edit', hint: 'F2', action: () => renameInline(s.id) },
+    { label: 'Duplicar…', icon: 'copy', action: () => editSession({ ...s, id: undefined, quick: undefined, lastUsed: undefined, favorite: false, name: (s.name || s.host || sessionTitle(s)) + ' (copia)' }, { title: 'Duplicar sesión' }) },
     s.host && { label: 'Copiar dirección', icon: 'copy', action: () => { const u = credOf(s) ? credOf(s).user : s.user; api('clip:write', `${u ? u + '@' : ''}${s.host}`); } },
     CRED_TYPES.includes(s.type) && { label: 'Asignar credencial…', icon: 'key', action: () => assignCredential([s], s.name || s.host) },
     { sep: true },
@@ -1096,6 +1367,7 @@ function sessionsPanel() {
   body.addEventListener('keydown', (e) => {
     if (e.target !== body) return;
     if (e.key === 'Delete' && sessSel.size) { e.preventDefault(); deleteSessions([...sessSel]); }
+    else if (e.key === 'F2' && sessSel.size === 1) { e.preventDefault(); renameInline([...sessSel][0]); }
     else if (e.key === 'Escape') { sessSel = new Set(); renderSide(); }
     else if (e.ctrlKey && e.code === 'KeyA') { e.preventDefault(); sessSel = new Set(sessVisible); renderSide(); $('#sideInner .side-body').focus(); }
     else if (e.key === 'Enter' && sessSel.size) { e.preventDefault(); D.sessions.filter((s) => sessSel.has(s.id)).forEach(openSession); }
@@ -1130,8 +1402,41 @@ function sessionsPanel() {
     }
     for (const s of node.sessions) body.append(dropTarget(sessionRow(s, true, depth), s.folder || ''));
   };
+  // Dos secciones: «Mis sesiones» (guardadas, con carpetas) y «Conexiones rápidas» (abiertas desde la barra)
+  const section = (key, ic, title, count, menu) => {
+    const isOpen = !!q || open[key] !== false;
+    const head = h('div', {
+      class: 'group-head section' + (isOpen ? '' : ' collapsed'),
+      onclick: () => { open[key] = !isOpen; save('settings'); renderSide(); },
+      oncontextmenu: (e) => { e.preventDefault(); e.stopPropagation(); showMenu(e.clientX, e.clientY, menu); },
+    }, icon('chevronDown', 13, 'chev'), icon(ic, 13, 'sect-ic'), h('span', { class: 'fname' }, title), h('span', { class: 'count' }, count));
+    return { head, isOpen };
+  };
   dropTarget(body, '');
-  walk(folderTree(list), 0);
+  if (D.sessions.length && list.length) {
+    const saved = list.filter((s) => !s.quick);
+    const quick = list.filter((s) => s.quick).sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0));
+    const mine = section('◆mine', 'server', 'Mis sesiones', saved.length, [
+      { label: 'Nueva sesión…', icon: 'plus', action: () => editSession() },
+    ]);
+    body.append(dropTarget(mine.head, ''));
+    if (mine.isOpen) {
+      walk(folderTree(saved), 0);
+      if (!saved.length && !q) body.append(h('div', { class: 'sect-hint' }, 'Arrastra aquí una conexión rápida para guardarla, o crea una sesión con +.'));
+    }
+    if (quick.length || !q) {
+      const qs = section('◆quick', 'zap', 'Conexiones rápidas', quick.length, [
+        { label: 'Vaciar conexiones rápidas…', icon: 'trash', danger: true, action: () => deleteSessions(D.sessions.filter((s) => s.quick).map((s) => s.id)) },
+      ]);
+      // soltar dentro de esta sección no mueve nada (el cursor indica que no se puede)
+      const box = h('div', { class: 'sect-quick', ondragover: (e) => e.stopPropagation() }, qs.head);
+      body.append(box);
+      if (qs.isOpen) {
+        for (const s of quick) box.append(sessionRow(s));
+        if (!quick.length) box.append(h('div', { class: 'sect-hint' }, 'Lo que abras desde la barra de conexión rápida aparece aquí, con el usuario y la contraseña que escribas. Arrástralo a una carpeta para guardarlo.'));
+      }
+    }
+  }
   const allFolders = () => [...new Set(D.sessions.flatMap((s) => String(s.folder || '').split('/').filter(Boolean).map((_, i, a) => a.slice(0, i + 1).join('/'))))];
   const search = h('input', { placeholder: 'Buscar sesiones…', value: sessionFilter, 'data-key': 'sessfilter', spellcheck: 'false' });
   search.addEventListener('input', () => { sessionFilter = search.value; renderSide(); });
@@ -1145,7 +1450,7 @@ function sessionsPanel() {
         { label: 'Exportar configuración completa…', icon: 'export', action: exportBackup },
         { label: 'Importar configuración…', icon: 'import', action: importBackup },
         { sep: true },
-        { label: 'Contraer todas las carpetas', icon: 'chevron', action: () => { S().openFolders = { '★': open['★'] }; save('settings'); renderSide(); } },
+        { label: 'Contraer todas las carpetas', icon: 'chevron', action: () => { S().openFolders = { '★': open['★'], '◆mine': open['◆mine'], '◆quick': open['◆quick'] }; save('settings'); renderSide(); } },
         { label: 'Expandir todas las carpetas', icon: 'chevronDown', action: () => { allFolders().forEach((f) => { open[f] = true; }); save('settings'); renderSide(); } },
       ]) }, icon('more', 16))),
     h('div', { class: 'side-search' }, icon('search', 14), search),
@@ -1389,6 +1694,8 @@ function editSession(existing, opts = {}) {
     if (s.clearPassword) { s.passwordEnc = ''; delete s.clearPassword; }
     if (password) s.passwordEnc = await api('secret:encrypt', password);
     if (passphrase) s.passphraseEnc = await api('secret:encrypt', passphrase);
+    // una conexión rápida a la que se le da carpeta (o «Guardar en Mis sesiones») pasa a ser guardada
+    if (s.quick && (opts.keep || s.folder)) keepSession(s, s.folder || '');
     if (isNew) { s.id = uid(); D.sessions.push(s); }
     else { const i = D.sessions.findIndex((x) => x.id === s.id); if (i >= 0) D.sessions[i] = s; else D.sessions.push(s); }
     save('sessions');
@@ -2156,13 +2463,43 @@ function renderQuick() {
   list.classList.toggle('open', document.activeElement === input && items.length > 0);
   list._items = items;
 }
+// Lo que se abre desde la barra queda en «Conexiones rápidas» (con el usuario y la contraseña que se
+// escriban al conectar). Repetir la misma dirección reutiliza la entrada; se guardan las QUICK_MAX más recientes.
+const QUICK_MAX = 40;
+function quickSession(p) {
+  const port = (x) => Number(x.port) || DEFAULT_PORTS[x.type];
+  const same = (s) => s.quick && s.type === p.type && String(s.host).toLowerCase() === p.host.toLowerCase() && port(s) === port(p) && (!p.user || s.user === p.user);
+  let s = D.sessions.filter(same).sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0))[0];
+  if (!s) { s = { id: uid(), ...p, quick: true }; D.sessions.push(s); }
+  s.lastUsed = Date.now();
+  const old = D.sessions.filter((x) => x.quick && !x.favorite).sort((a, b) => b.lastUsed - a.lastUsed).slice(QUICK_MAX).map((x) => x.id);
+  if (old.length) {
+    D.sessions = D.sessions.filter((x) => !old.includes(x.id));
+    D.recent = D.recent.filter((x) => !old.includes(x));
+    save('recent');
+  }
+  save('sessions');
+  return s;
+}
+
+// El proceso principal devuelve lo escrito al conectar una conexión rápida (contraseña ya cifrada)
+rx.on('store:learned', (id, fields) => {
+  const s = D.sessions.find((x) => x.id === id);
+  if (!s || !s.quick) return;
+  if (fields.user && !s.user) s.user = fields.user;
+  if (fields.passwordEnc && !s.passwordEnc) s.passwordEnc = fields.passwordEnc;
+  save('sessions');
+  renderSide();
+});
+
 function runQuick(it) {
   const input = $('#quickInput');
   input.value = '';
   input.blur();
   $('#quickList').classList.remove('open');
   if (it.s) openSession(it.s);
-  else if (it.quick) openSession(it.quick);
+  else if (it.quick) openSession(quickSession(it.quick));
+  if (panel === 'sessions') renderSide();
 }
 (() => {
   const input = $('#quickInput');
@@ -2317,6 +2654,7 @@ function openSettings(page = 'appearance') {
         check('confirmClose', 'Confirmar antes de cerrar pestañas conectadas'),
         check('autoSftp', 'Mostrar el explorador SFTP al conectar por SSH'),
         field('Avisar al pegar más de N líneas (0 = nunca)', pw),
+        field('Sesiones RDP', (() => { const sel = h('select', { class: 'select' }, h('option', { value: 'mstsc' }, 'Abrir con Escritorio remoto de Windows (ventana aparte)'), h('option', { value: 'tab' }, 'Abrir en una pestaña de ReaXTerm (integrado, experimental)')); sel.value = s.rdpMode; sel.addEventListener('change', () => { s.rdpMode = sel.value; changed(); }); return sel; })()),
         check('compactSessions', 'Vista compacta de sesiones (usuario y servidor al pasar el mouse)', renderSide)];
     }],
     credentials: ['Credenciales', 'key', () => {
@@ -2403,6 +2741,7 @@ function zoom(delta) {
 
 document.addEventListener('keydown', (e) => {
   if ($('.backdrop') || $('.palette')) return;
+  if (rdpFocused()) return; // en una sesión RDP las teclas son del equipo remoto
   if (!isGlobalShortcut(e)) return;
   e.preventDefault();
   const c = e.code;
@@ -2429,7 +2768,7 @@ document.addEventListener('wheel', (e) => {
 
 // Cierre de la ventana con conexiones abiertas
 rx.on('app:request-close', async (count) => {
-  if (!S().confirmClose || await confirmBox('Salir de ReaXTerm', `Hay ${count} conexión(es) abierta(s). ¿Cerrarlas y salir?`, { okLabel: 'Salir', danger: true })) api('app:quit');
+  if (!S().confirmClose || await confirmBox('Salir de ReaXTerm', `Hay ${count} sesión(es) abierta(s). ¿Cerrarlas y salir?`, { okLabel: 'Salir', danger: true })) api('app:quit');
 });
 
 matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => { if (S().appTheme === 'system') applyTheme(); });

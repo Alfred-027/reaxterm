@@ -13,6 +13,8 @@ const { parseMobaXtermSessions, mergeImports, parseMobaXtermPasswords } = requir
 const backup = require('./src/backup');
 const { connectFtp } = require('./src/ftpfs');
 const importers = require('./src/importers');
+const { createRdpProxy } = require('./src/rdpproxy');
+const { createKeyHook } = require('./src/keyhook');
 let SerialPort = null;
 try { ({ SerialPort } = require('serialport')); } catch { /* puerto serie no disponible */ }
 
@@ -126,6 +128,16 @@ function fillCredential(cred, fields) {
   if (win && !win.isDestroyed()) win.webContents.send('store:changed', 'credentials', data.credentials);
 }
 
+// Conexión rápida: el usuario y la contraseña escritos al conectar quedan en la propia sesión
+// (la ventana es dueña de la lista de sesiones y la guarda)
+function learnQuick(s, fields) {
+  if (!s || !s.quick || !s.id || credentialFor(s)) return;
+  const learned = {};
+  if (fields.user) learned.user = fields.user;
+  if (fields.password) learned.passwordEnc = encrypt(fields.password);
+  if (Object.keys(learned).length) send('store:learned', s.id, learned);
+}
+
 async function sshConfig(s) {
   const port = Number(s.port) || 22;
   const cred = credentialFor(s);
@@ -187,7 +199,7 @@ async function connectSsh(s) {
       }
       finish(answers);
     });
-    client.once('ready', () => { ready = true; fillCredential(built.cred, built.typed); resolve(client); });
+    client.once('ready', () => { ready = true; fillCredential(built.cred, built.typed); learnQuick(s, built.typed); resolve(client); });
     client.on('error', (err) => { if (!ready) reject(err); });
     client.connect(built.cfg);
   });
@@ -359,6 +371,7 @@ async function openFtp(id, s) {
   const fsx = await connectFtp({ host: s.host, port, user, password, secure: s.ftpSecure, insecure: s.ftpInsecure });
   if (cancelled.delete(id)) { fsx.end(); return; }
   fillCredential(cred, { password: typed });
+  learnQuick(s, { password: typed });
   fsx.client.ftp.socket.on('close', () => closed(id, 'Conexión FTP cerrada'));
   conns.set(id, { type: 'ftp', fs: fsx, session: s, watchers: [], filesOnly: true });
   status(id, 'connected', `${s.ftpSecure ? 'ftps' : 'ftp'} ${user || 'anonymous'}@${s.host}:${port}`);
@@ -860,6 +873,81 @@ handle('launch:rdp', (s) => {
   return true;
 });
 
+// ---------------------------------------------------------------- RDP en pestaña (IronRDP + RDCleanPath)
+// Diagnóstico de RDP en pestaña: sólo estructura (tamaños), nunca contenido ni credenciales
+function rdpLog(m) {
+  console.log(m);
+  try {
+    const file = path.join(app.getPath('userData'), 'rdp-debug.log');
+    if (fs.existsSync(file) && fs.statSync(file).size > 512 * 1024) fs.rmSync(file);
+    fs.appendFileSync(file, `${new Date().toISOString()} ${m}\n`);
+  } catch { /* sin registro */ }
+}
+const rdpProxy = createRdpProxy({
+  log: rdpLog,
+  // Capacidades del servidor detectadas por el puente (la pestaña las identifica por su token)
+  onEvent: (token, kind) => send('launch:rdpEvent', token, kind),
+  // Huella del certificado TLS del servidor RDP: misma lógica de «servidores conocidos» que SSH
+  verifyCert: async (destination, fingerprint) => {
+    const id = `rdp:${destination}`;
+    const known = data.knownHosts && data.knownHosts[id];
+    if (known === fingerprint) return true;
+    const answer = await ask({ kind: 'hostkey', host: `${destination} (certificado RDP)`, fingerprint, changed: !!known, previous: known });
+    if (answer === 'save') { data.knownHosts = { ...(data.knownHosts || {}), [id]: fingerprint }; saveData(); }
+    return answer === 'save' || answer === 'once';
+  },
+});
+const rdpPending = new Map(); // id de preparación -> { cred, typed }
+
+handle('launch:rdpPrepare', async (s, opt) => {
+  if (!validHost(s.host)) throw new Error('Host no válido');
+  // Reconexión de una pestaña ya autenticada (cambio de tamaño): sólo un ticket nuevo para el puente
+  if (opt && opt.ticketOnly) {
+    const destination = `${s.host}:${Number(s.port) || 3389}`;
+    return { destination, ...(await rdpProxy.ticket(destination)) };
+  }
+  const cred = credentialFor(s);
+  let user = cred ? cred.user : s.user;
+  let password = decrypt(cred ? cred.passwordEnc : s.passwordEnc);
+  const typed = {};
+  if (!user) {
+    user = await ask({ kind: 'text', title: 'Usuario', message: cred ? `Usuario de la credencial «${cred.name}» (se guardará)` : `Usuario para ${s.host} (DOMINIO\\usuario)` });
+    if (!user) throw new Error('Conexión cancelada');
+    typed.user = user;
+  }
+  if (!password) {
+    password = await ask({ kind: 'password', title: 'Contraseña', message: cred ? `Contraseña de la credencial «${cred.name}» (${user}) — se guardará cifrada` : `Contraseña para ${user}@${s.host}` });
+    if (password == null) throw new Error('Conexión cancelada');
+    typed.password = password;
+  }
+  // «DOMINIO\usuario» o «usuario@dominio»
+  let domain = '';
+  const bs = user.indexOf('\\');
+  if (bs > 0) { domain = user.slice(0, bs); user = user.slice(bs + 1); }
+  const destination = `${s.host}:${Number(s.port) || 3389}`;
+  const { proxyAddress, token } = await rdpProxy.ticket(destination);
+  const prepId = crypto.randomUUID();
+  rdpPending.set(prepId, { cred, typed, s });
+  setTimeout(() => rdpPending.delete(prepId), 120000);
+  return { prepId, proxyAddress, token, destination, user, domain, password };
+});
+
+// Tecla Windows, Win+letra, Ctrl+Esc y Alt+Tab hacia la sesión RDP con foco (ver src/keyhook.js)
+const keyHook = createKeyHook({
+  hwnd: () => win.getNativeWindowHandle().readBigUInt64LE(0).toString(),
+  onKey: (type, vk) => send('launch:rdpKey', type, vk),
+  log: (m) => console.log(m),
+});
+handle('launch:rdpKeys', (on) => { keyHook.setActive(on); return true; });
+
+// La conexión funcionó: se guarda en la credencial lo que se escribió al conectar
+handle('launch:rdpConnected', (prepId) => {
+  const p = rdpPending.get(prepId);
+  rdpPending.delete(prepId);
+  if (p) { fillCredential(p.cred, p.typed); learnQuick(p.s, p.typed); }
+  return true;
+});
+
 handle('launch:explorer', (p) => shell.openPath(p || os.homedir()));
 
 // ---------------------------------------------------------------- Datos
@@ -1101,6 +1189,16 @@ function createWindow() {
     return { action: 'deny' };
   });
   win.webContents.on('will-navigate', (e) => e.preventDefault());
+  // Avisos y errores de IronRDP (WebAssembly) al registro de diagnóstico RDP: son mensajes del
+  // decodificador (tipos y tamaños), no contenido de la sesión
+  let rdpConsole = 0;
+  win.webContents.on('console-message', (e, lvl, message) => {
+    const msg = String(e.message ?? message ?? '');
+    const level = e.level ?? (lvl === 2 ? 'warning' : lvl === 3 ? 'error' : 'info');
+    if ((level === 'warning' || level === 'error') &&/ironrdp|rdp|bitmap|bpp|codec|palette|update/i.test(msg) && rdpConsole++ < 300) {
+      rdpLog(`rdp: IronRDP [${level}] ${msg.replace(/\s+/g, ' ').slice(0, 300)}`);
+    }
+  });
   win.webContents.on('before-input-event', (_e, input) => {
     if (input.type === 'keyDown' && input.key === 'F12') win.webContents.toggleDevTools();
   });
@@ -1109,7 +1207,8 @@ function createWindow() {
     const b = win.getNormalBounds();
     data.windowState = { ...b, maximized: win.isMaximized() };
     try { saveData(); } catch { /* ignore */ }
-    if (!forceQuit && conns.size) { e.preventDefault(); send('app:request-close', conns.size); }
+    const open = conns.size + rdpProxy.active();
+    if (!forceQuit && open) { e.preventDefault(); send('app:request-close', open); }
   });
 
   if (SMOKE) {
@@ -1139,6 +1238,7 @@ if (!app.requestSingleInstanceLock()) {
     createWindow();
   });
   app.on('before-quit', () => {
+    keyHook.stop();
     for (const id of [...conns.keys()]) closeConn(id);
     for (const id of [...tunnels.keys()]) stopTunnel(id);
   });
