@@ -1,7 +1,8 @@
 # Compila ReaXTerm en Windows y lo firma con SignPath en dos etapas:
 #   1. ReaXTerm.exe (la aplicación, que va dentro del instalador y del portable)
 #   2. El instalador y el portable, armados con la aplicación ya firmada
-# Se ejecuta al publicar una etiqueta v* (crea la Release) o a mano desde la pestaña Actions.
+# Se ejecuta sólo a mano desde la pestaña Actions (Run workflow), eligiendo la etiqueta v* a firmar:
+# así crear una Release no lo dispara mientras no haya firma configurada.
 #
 # Configuración necesaria en GitHub (Settings › Secrets and variables › Actions):
 #   secreto   SIGNPATH_API_TOKEN        token de un usuario CI de SignPath
@@ -9,8 +10,6 @@
 name: Compilar y firmar
 
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
 
 permissions:
