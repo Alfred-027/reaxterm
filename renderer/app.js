@@ -662,7 +662,9 @@ rx.on('term:data', (id, d) => {
 // Se instala una sola vez por conexión un gancho de prompt que emite el directorio actual como
 // secuencia OSC invisible. El eco de la instalación se descarta hasta ver la marca OSC 7338.
 const FOLLOW_MARK = '\x1b]7338;\x07';
-const FOLLOW_HOOK = ` __rx_cwd(){ printf '\\033]7337;%s\\007' "$PWD"; }; if [ -n "$ZSH_VERSION" ]; then precmd_functions+=(__rx_cwd); else PROMPT_COMMAND="__rx_cwd\${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; fi; printf '\\033]7338;\\007'`;
+// En bash la línea se borra a sí misma del historial (sólo si es la última entrada: con HISTCONTROL=ignorespace
+// ni siquiera entra, y entonces no se toca nada)
+const FOLLOW_HOOK = ` __rx_cwd(){ printf '\\033]7337;%s\\007' "$PWD"; }; if [ -n "$ZSH_VERSION" ]; then precmd_functions+=(__rx_cwd); else PROMPT_COMMAND="__rx_cwd\${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; read -r __rx_n __rx_l <<< "$(HISTTIMEFORMAT= history 1)"; [[ $__rx_l == *__rx_cwd* ]] && history -d "$__rx_n"; unset __rx_n __rx_l; fi; printf '\\033]7338;\\007'`;
 
 function swallowData(t, chunk) {
   const sw = t.swallow;
