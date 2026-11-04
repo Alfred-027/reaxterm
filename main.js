@@ -15,6 +15,7 @@ const { connectFtp } = require('./src/ftpfs');
 const importers = require('./src/importers');
 const { createRdpProxy } = require('./src/rdpproxy');
 const { createKeyHook } = require('./src/keyhook');
+const { remoteCwd } = require('./src/remotecwd');
 let SerialPort = null;
 try { ({ SerialPort } = require('serialport')); } catch { /* puerto serie no disponible */ }
 
@@ -451,6 +452,12 @@ function closeConn(id) {
   } catch { /* ignore */ }
 }
 handle('term:close', (id) => closeConn(id));
+
+// Directorio actual del shell SSH, consultado por un canal aparte (ver src/remotecwd.js)
+handle('term:cwd', (id) => {
+  const c = conns.get(id);
+  return c && c.type === 'ssh' && c.stream ? remoteCwd(c.client) : null;
+});
 
 handle('term:log', async (id, enable, title) => {
   const c = conns.get(id);

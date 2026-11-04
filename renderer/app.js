@@ -305,14 +305,17 @@ function openSession(s, opts = {}) {
     id, session: { ...s }, term, fit, search, el: pane, state: 'connecting', statusText: 'Conectando…',
     startedAt: null, title: sessionTitle(s), logging: null, multi: !noTerminal(s.type), opened: false,
   };
-  // El shell remoto informa su directorio con OSC 7337 (ReaXTerm) u OSC 7 (estándar): es invisible
+  // Directorio del shell (consulta por canal aparte, ver askCwd, u OSC 7 si el shell lo informa). El explorador
+  // sólo se mueve cuando ese directorio cambia: si navegaste a otra carpeta, un comando cualquiera no te saca de ahí.
   const onCwd = (dir) => {
     if (!dir) return;
     t.cwd = dir;
     const st = sftp.get(id);
-    if (S().sftpFollow && st && st.cwd !== dir && !st.loading) sftpLoad(id, dir);
+    if (!S().sftpFollow || !st || st.loading || t.cwdShown === dir) return;
+    t.cwdShown = dir;
+    if (st.cwd !== dir) sftpLoad(id, dir);
   };
-  term.parser.registerOscHandler(7337, (data) => { onCwd(data.trim()); return true; });
+  t.onCwd = onCwd;
   term.parser.registerOscHandler(7, (data) => {
     try { onCwd(decodeURIComponent(new URL(data).pathname)); } catch { /* no es una URL file:// */ }
     return true;
@@ -364,8 +367,11 @@ function bindTerminalInput(t) {
       return;
     }
     if (t.state !== 'connected') return;
-    if (multiExec && t.multi) { for (const o of tabs.values()) if (o.state === 'connected' && o.multi) rx.write(o.id, d); }
-    else rx.write(t.id, d);
+    const targets = multiExec && t.multi ? [...tabs.values()].filter((o) => o.state === 'connected' && o.multi) : [t];
+    for (const o of targets) {
+      rx.write(o.id, d);
+      if (d.includes('\r')) watchCwd(o);
+    }
   });
   term.onBinary((d) => rx.write(t.id, d));
   term.onResize(({ cols, rows }) => rx.resize(t.id, cols, rows));
@@ -653,47 +659,30 @@ function rdpCapability(t, kind) {
 rx.on('term:data', (id, d) => {
   const t = tabs.get(id);
   if (!t) return;
-  const chunk = typeof d === 'string' ? d : new Uint8Array(d);
-  t.lastData = Date.now();
-  if (t.swallow) swallowData(t, chunk); else t.term.write(chunk);
+  t.term.write(typeof d === 'string' ? d : new Uint8Array(d));
 });
 
-// ------------------------------------------------------------ seguir a la terminal (silencioso)
-// Se instala una sola vez por conexión un gancho de prompt que emite el directorio actual como
-// secuencia OSC invisible. El eco de la instalación se descarta hasta ver la marca OSC 7338.
-const FOLLOW_MARK = '\x1b]7338;\x07';
-// En bash la línea se borra a sí misma del historial (sólo si es la última entrada: con HISTCONTROL=ignorespace
-// ni siquiera entra, y entonces no se toca nada)
-const FOLLOW_HOOK = ` __rx_cwd(){ printf '\\033]7337;%s\\007' "$PWD"; }; if [ -n "$ZSH_VERSION" ]; then precmd_functions+=(__rx_cwd); else PROMPT_COMMAND="__rx_cwd\${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; read -r __rx_n __rx_l <<< "$(HISTTIMEFORMAT= history 1)"; [[ $__rx_l == *__rx_cwd* ]] && history -d "$__rx_n"; unset __rx_n __rx_l; fi; printf '\\033]7338;\\007'`;
-
-function swallowData(t, chunk) {
-  const sw = t.swallow;
-  sw.raw.push(chunk);
-  sw.text += typeof chunk === 'string' ? chunk : sw.dec.decode(chunk, { stream: true });
-  const i = sw.text.indexOf(FOLLOW_MARK);
-  if (i < 0) return;
-  clearTimeout(sw.timer);
-  t.swallow = null;
-  t.followHooked = true;
-  // Se borra la línea del prompt anterior: el nuevo prompt se dibuja en su lugar
-  t.term.write('\r\x1b[2K' + sw.text.slice(i + FOLLOW_MARK.length).replace(/^\r?\n/, ''));
+// ------------------------------------------------------------ seguir a la terminal
+// Tras cada Enter se consulta el directorio del shell por un canal SSH aparte (src/remotecwd.js): no se escribe
+// nada en el shell ni queda en su historial. Sin respuesta (sudo -i) el explorador se queda donde está; si un
+// servidor nunca responde (equipo de red, Linux sin ps completo), se avisa y no se le vuelve a preguntar.
+function askCwd(t) {
+  if (!tabs.has(t.id) || !S().sftpFollow || t.session.type !== 'ssh' || t.state !== 'connected' || t.cwdBusy || t.cwdFails >= 2) return;
+  t.cwdBusy = true;
+  api('term:cwd', t.id).catch(() => null).then((dir) => {
+    t.cwdBusy = false;
+    if (dir) { t.cwdOk = true; t.onCwd(dir); return; }
+    if (t.cwdOk || !tabs.has(t.id) || t.state !== 'connected') return;
+    t.cwdFails = (t.cwdFails || 0) + 1;
+    if (t.cwdFails >= 2) toast(`${t.title}: este servidor no permite consultar el directorio de la terminal; el explorador no lo seguirá`, 'warn');
+  });
 }
 
-function hookFollow(t, tries = 0) {
-  if (!tabs.has(t.id) || t.session.type !== 'ssh' || t.state !== 'connected' || t.followHooked || t.swallow) return;
-  // Espera a que el shell esté inactivo (sin salida reciente) para no mezclarse con el MOTD o un comando
-  const quiet = Date.now() - (t.lastData || 0) > 700 && Date.now() - (t.startedAt || 0) > 1200;
-  if (!quiet) { if (tries < 40) setTimeout(() => hookFollow(t, tries + 1), 400); return; }
-  t.swallow = { raw: [], text: '', dec: new TextDecoder() };
-  // Si el shell no es bash/zsh (p. ej. un equipo de red) se muestra lo recibido tal cual
-  t.swallow.timer = setTimeout(() => {
-    const sw = t.swallow;
-    if (!sw) return;
-    t.swallow = null;
-    t.followHooked = true;
-    for (const c of sw.raw) t.term.write(c);
-  }, 3000);
-  rx.write(t.id, '\x05\x15' + FOLLOW_HOOK + '\r');
+// La consulta se repite un poco después por si el comando tarda (o el explorador estaba cargando)
+function watchCwd(t) {
+  if (!S().sftpFollow || t.session.type !== 'ssh') return;
+  for (const x of t.cwdTimers || []) clearTimeout(x);
+  t.cwdTimers = [300, 1500].map((ms) => setTimeout(() => askCwd(t), ms));
 }
 
 function toggleFollow(id) {
@@ -701,8 +690,9 @@ function toggleFollow(id) {
   save('settings');
   const t = tabs.get(id);
   if (S().sftpFollow && t) {
-    if (t.cwd) sftpLoad(id, t.cwd);
-    hookFollow(t);
+    t.cwdShown = null;
+    t.cwdFails = 0;
+    watchCwd(t);
   }
   toast(S().sftpFollow ? 'El explorador sigue al directorio de la terminal' : 'Seguimiento de la terminal desactivado', 'info', 2200);
   renderSide();
@@ -714,11 +704,13 @@ rx.on('term:status', (id, state, text) => {
   t.statusText = text;
   if (state === 'connected') {
     t.startedAt = Date.now();
-    t.followHooked = false;
     if (t.session.type === 'ssh') {
       sftp.delete(id);
+      t.cwdShown = null;
+      t.cwdOk = false;
+      t.cwdFails = 0;
       if (S().autoSftp && activeId === id) setPanel('sftp');
-      if (S().sftpFollow) hookFollow(t);
+      watchCwd(t); // el comando inicial de la sesión pudo cambiar de directorio
     }
     if (isFilesType(t.session.type)) { sftp.delete(id); sftpLoad(id, '.'); }
     rx.resize(id, t.term.cols, t.term.rows);
@@ -731,7 +723,6 @@ rx.on('term:exit', (id, reason) => {
   t.state = 'closed';
   t.statusText = reason;
   t.logging = null;
-  t.followHooked = false;
   t.term.write(`\r\n\x1b[33m● ${reason}. Pulsa R para reconectar o Enter para cerrar la pestaña.\x1b[0m\r\n`);
   sftp.delete(id);
   renderAll();
@@ -1363,6 +1354,10 @@ function sessionsPanel() {
   const match = (s) => !q || [s.name, s.host, userOf(s), s.folder, s.notes].some((v) => v && String(v).toLowerCase().includes(q));
   const list = D.sessions.filter(match).sort((a, b) => (a.name || a.host || '').localeCompare(b.name || b.host || '', 'es'));
   const open = S().openFolders;
+  // Al contraer una carpeta (o «Mis sesiones», con prefix '') también se contraen las que tiene dentro
+  const collapseChildren = (prefix) => {
+    for (const key of Object.keys(open)) if (key.startsWith(prefix) && !/^[★◆]/.test(key)) delete open[key];
+  };
   sessVisible = [];
   for (const id of [...sessSel]) if (!D.sessions.some((s) => s.id === id)) sessSel.delete(id);
   const body = h('div', { class: 'side-body', tabindex: '0' });
@@ -1395,7 +1390,7 @@ function sessionsPanel() {
       const head = h('div', {
         class: 'group-head folder' + (isOpen ? '' : ' collapsed'), style: { paddingLeft: 6 + depth * 14 + 'px' }, title: k.path, draggable: 'true',
         ondragstart: (e) => { e.dataTransfer.setData(DRAG_FOLDER, k.path); e.dataTransfer.effectAllowed = 'move'; },
-        onclick: () => { open[k.path] = !isOpen; save('settings'); renderSide(); },
+        onclick: () => { open[k.path] = !isOpen; if (isOpen) collapseChildren(k.path + '/'); save('settings'); renderSide(); },
         oncontextmenu: (e) => { e.preventDefault(); e.stopPropagation(); showMenu(e.clientX, e.clientY, folderMenu(k)); },
       }, icon('chevronDown', 13, 'chev'), h('span', { class: 'fold-wrap', style: fs.color ? { color: fs.color } : null }, icon(fs.icon || 'folder', 14, 'fold')),
       h('span', { class: 'fname' }, k.name), h('span', { class: 'count' }, k.count));
@@ -1409,7 +1404,7 @@ function sessionsPanel() {
     const isOpen = !!q || open[key] !== false;
     const head = h('div', {
       class: 'group-head section' + (isOpen ? '' : ' collapsed'),
-      onclick: () => { open[key] = !isOpen; save('settings'); renderSide(); },
+      onclick: () => { open[key] = !isOpen; if (isOpen && key === '◆mine') collapseChildren(''); save('settings'); renderSide(); },
       oncontextmenu: (e) => { e.preventDefault(); e.stopPropagation(); showMenu(e.clientX, e.clientY, menu); },
     }, icon('chevronDown', 13, 'chev'), icon(ic, 13, 'sect-ic'), h('span', { class: 'fname' }, title), h('span', { class: 'count' }, count));
     return { head, isOpen };
@@ -2457,7 +2452,10 @@ function renderQuick() {
   const matches = quickMatches(q);
   const items = matches.map((s) => ({ s, label: s.name || s.host, sub: `${s.user ? s.user + '@' : ''}${s.host || TYPES[s.type].label}`, ic: TYPES[s.type].icon }));
   const parsed = q && parseQuick(q);
-  if (parsed) items.push({ quick: parsed, label: `Conectar: ${parsed.type.toUpperCase()} ${parsed.user ? parsed.user + '@' : ''}${parsed.host}${parsed.port ? ':' + parsed.port : ''}`, sub: 'Enter', ic: 'zap' });
+  if (parsed) {
+    const conn = { quick: parsed, label: `Conectar: ${parsed.type.toUpperCase()} ${parsed.user ? parsed.user + '@' : ''}${parsed.host}${parsed.port ? ':' + parsed.port : ''}`, sub: isAddress(q) ? 'Nueva conexión · Enter' : 'Enter', ic: 'zap' };
+    if (isAddress(q)) items.unshift(conn); else items.push(conn);
+  }
   quickSel = Math.min(quickSel, Math.max(0, items.length - 1));
   list.replaceChildren(...items.map((it, i) => h('div', {
     class: 'pal-item' + (i === quickSel ? ' sel' : ''), onmousedown: (e) => { e.preventDefault(); runQuick(it); },
@@ -2465,13 +2463,25 @@ function renderQuick() {
   list.classList.toggle('open', document.activeElement === input && items.length > 0);
   list._items = items;
 }
-// Lo que se abre desde la barra queda en «Conexiones rápidas» (con el usuario y la contraseña que se
-// escriban al conectar). Repetir la misma dirección reutiliza la entrada; se guardan las QUICK_MAX más recientes.
+// Una dirección escrita tal cual (IP completa, usuario@, servidor:puerto, nombre con dominio o «rdp …») es siempre
+// una conexión nueva, aunque ya exista una sesión con esa IP: puede ser otro usuario o contraseña, o una IP
+// reutilizada. Las sesiones guardadas se siguen ofreciendo debajo. El texto libre busca sesiones primero.
+function isAddress(q) {
+  return /^(ssh|telnet|rdp)\s/i.test(q) || q.includes('@') || /^\d{1,3}(\.\d{1,3}){3}(\D|$)/.test(q) || /^\[|^[^\s:]+:\d+$/.test(q)
+    || (q.match(/:/g) || []).length > 1 || /^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}(\s+\d+)?$/i.test(q);
+}
+
 const QUICK_MAX = 40;
-function quickSession(p) {
+const sameTarget = (a, b) => {
   const port = (x) => Number(x.port) || DEFAULT_PORTS[x.type];
-  const same = (s) => s.quick && s.type === p.type && String(s.host).toLowerCase() === p.host.toLowerCase() && port(s) === port(p) && (!p.user || s.user === p.user);
-  let s = D.sessions.filter(same).sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0))[0];
+  return a.type === b.type && String(a.host).toLowerCase() === String(b.host).toLowerCase() && port(a) === port(b) && (a.user || '') === (b.user || '');
+};
+
+// Lo que se abre desde la barra queda en «Conexiones rápidas», con el usuario y la contraseña que se escriban al
+// conectar (si funciona; ver store:learned). No se reutiliza una contraseña guardada: siempre se pregunta. Sólo se
+// reaprovecha una entrada sin contraseña, para que los intentos fallidos no llenen la lista.
+function quickSession(p) {
+  let s = D.sessions.find((x) => x.quick && !x.passwordEnc && !x.credentialId && sameTarget(x, p));
   if (!s) { s = { id: uid(), ...p, quick: true }; D.sessions.push(s); }
   s.lastUsed = Date.now();
   const old = D.sessions.filter((x) => x.quick && !x.favorite).sort((a, b) => b.lastUsed - a.lastUsed).slice(QUICK_MAX).map((x) => x.id);
@@ -2490,6 +2500,17 @@ rx.on('store:learned', (id, fields) => {
   if (!s || !s.quick) return;
   if (fields.user && !s.user) s.user = fields.user;
   if (fields.passwordEnc && !s.passwordEnc) s.passwordEnc = fields.passwordEnc;
+  // Mismo servidor y usuario que otra conexión rápida: esta la reemplaza, con la contraseña que acaba de funcionar
+  const old = D.sessions.filter((x) => x !== s && x.quick && sameTarget(x, s));
+  for (const x of old) {
+    for (const k of ['name', 'favorite', 'color', 'notes']) if (x[k] && !s[k]) s[k] = x[k];
+    D.recent = D.recent.map((r) => (r === x.id ? s.id : r));
+  }
+  if (old.length) {
+    D.sessions = D.sessions.filter((x) => !old.includes(x));
+    D.recent = [...new Set(D.recent)];
+    save('recent');
+  }
   save('sessions');
   renderSide();
 });

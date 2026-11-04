@@ -1,7 +1,7 @@
 {
   "name": "reaxterm",
   "productName": "ReaXTerm",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "ReaXTerm - Terminal moderno con SSH, SFTP, FTP, Telnet, RDP, puerto serie, túneles y multi-ejecución",
   "main": "main.js",
   "author": "Alfredo Garrido",
