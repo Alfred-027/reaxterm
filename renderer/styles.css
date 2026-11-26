@@ -232,6 +232,7 @@ kbd {
 .tab-add { width: 30px; height: 30px; margin-bottom: 2px; border-radius: 8px; border: 0; background: transparent; color: var(--text-2); cursor: pointer; display: flex; align-items: center; justify-content: center; flex: none; }
 .tab-add:hover { background: var(--bg-2); color: var(--text); }
 /* Desplazamiento de la barra cuando las pestañas no caben */
+.layout-btn { width: auto; padding: 0 5px; gap: 1px; }
 .tab-scroll { display: none; width: 22px; height: 30px; margin-bottom: 2px; border-radius: 7px; border: 0; background: transparent; color: var(--text-2); cursor: pointer; align-items: center; justify-content: center; flex: none; padding: 0; }
 .tabbar.overflow .tab-scroll { display: flex; }
 .tab-scroll:hover:not(:disabled) { background: var(--bg-2); color: var(--text); }
@@ -319,6 +320,7 @@ textarea.mono { font-family: 'Cascadia Mono', Consolas, monospace; font-size: 12
 .statusbar .spacer { flex: 1; }
 .statusbar .pill { padding: 1px 8px; border-radius: 10px; font-weight: 600; font-size: 11px; }
 .statusbar .pill.warn { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
+.statusbar .pill.muted { background: var(--bg-4); color: var(--text-2); }
 .statusbar .pill.ok { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
 .statusbar .clickable { cursor: pointer; }
 .statusbar .clickable:hover { color: var(--text); }

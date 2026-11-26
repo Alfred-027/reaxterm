@@ -75,7 +75,7 @@ const DEFAULT_SETTINGS = {
   lineHeight: 1.15, termTheme: 'reax', cursorStyle: 'bar', cursorBlink: true, scrollback: 10000, copyOnSelect: true,
   rightClickPaste: false, confirmClose: true, autoSftp: true, defaultShell: 'powershell', sidebarWidth: 290,
   sidebarOpen: true, openFolders: {}, folderStyles: {}, compactSessions: true, rdpMode: 'mstsc', sftpHidden: false, sftpFollow: false, webgl: true, pasteWarnLines: 5,
-  gridLayout: 'auto',
+  gridLayout: 'auto', pasteToAll: true,
 };
 const DEFAULT_SNIPPETS = [
   ['Información del sistema', 'uname -a && cat /etc/os-release | head -n 4 && uptime'],
@@ -451,11 +451,24 @@ async function pasteInto(t) {
   if (!text) return;
   const lines = text.split(/\r?\n/).length;
   if (S().pasteWarnLines && lines > S().pasteWarnLines) {
-    const ok = await confirmBox('Pegar varias líneas', `Vas a pegar ${lines} líneas en «${t.title}»${isBroadcasting(t) ? ' y en las demás terminales de la multi-ejecución' : ''}. Cada línea podría ejecutarse como comando.`, { okLabel: 'Pegar' });
+    const ok = await confirmBox('Pegar varias líneas', `Vas a pegar ${lines} líneas en «${t.title}»${isBroadcasting(t) && S().pasteToAll ? ' y en las demás terminales de la multi-ejecución' : ''}. Cada línea podría ejecutarse como comando.`, { okLabel: 'Pegar' });
     if (!ok) return;
   }
-  t.term.paste(text);
+  pasteText(t, text);
+}
+
+// Con multi-ejecución, Ctrl+V pega en todas o sólo en la terminal activa según el interruptor de la barra de estado
+function pasteText(t, text) {
+  if (broadcastScope(t)) pasteToTargets(S().pasteToAll ? broadcastTargets(t) : [t], text);
+  else t.term.paste(text);
   t.term.focus();
+}
+
+function togglePasteToAll() {
+  S().pasteToAll = !S().pasteToAll;
+  save('settings');
+  toast(S().pasteToAll ? 'Con multi-ejecución, Ctrl+V pega en todas las terminales' : 'Con multi-ejecución, Ctrl+V pega sólo en la terminal activa', 'info', 2200);
+  renderStatus();
 }
 
 // Pegado en todas las terminales de la multi-ejecución a la vez, incluida la activa aunque esté excluida
@@ -1160,15 +1173,16 @@ function renderAll() {
 
 function renderTitleActions() {
   const box = $('#titleActions');
-  box.replaceChildren(
+  // replaceChildren convierte un null en el texto "null": sólo se pasan los botones que corresponden
+  box.replaceChildren(...[
     h('button', { class: 'icon-btn tip-down', 'data-tip': 'Nueva sesión (Ctrl+Shift+N)', onclick: () => editSession() }, icon('plus', 17)),
     h('button', { class: 'icon-btn tip-down', 'data-tip': 'Terminal local', onclick: (e) => shellMenu(e) }, icon('terminal', 17)),
     h('button', { class: 'icon-btn tip-down' + (multiExec ? ' warn-on' : ''), 'data-tip': 'Multi-ejecución (Ctrl+Shift+M)', onclick: toggleMulti }, icon('broadcast', 17)),
     broadcastScope(tabs.get(activeId)) && h('button', { class: 'icon-btn tip-down warn-on', 'data-tip': 'Multi-pegado: pegar en todas las terminales (Ctrl+Shift+U)', onclick: () => multiPaste() }, icon('paste', 17)),
     h('button', { class: 'icon-btn tip-down' + (layout === 'grid' ? ' on' : ''), 'data-tip': 'Vista en mosaico (Ctrl+Shift+L)', onclick: toggleLayout, oncontextmenu: (e) => { e.preventDefault(); layoutMenu(e); } }, icon(layout === 'grid' ? 'tabs' : 'grid', 17)),
-    h('button', { class: 'icon-btn tip-down' + (shownGroup() ? ' on' : ''), 'data-tip': 'Disposición del mosaico y grupos de pestañas', onclick: layoutMenu }, icon(shownGroup() ? layoutIcon(shownGroup().layout) : layoutIcon(S().gridLayout), 17)),
+    h('button', { class: 'icon-btn tip-down layout-btn' + (shownGroup() ? ' on' : ''), 'data-tip': 'Disposición del mosaico y grupos de pestañas', onclick: layoutMenu }, icon('lyMainLeft', 17), icon('chevronDown', 10)),
     h('button', { class: 'icon-btn tip-down', 'data-tip': 'Ajustes', onclick: () => openSettings() }, icon('settings', 17)),
-  );
+  ].filter(Boolean));
 }
 
 function shellMenu(e) {
@@ -1312,7 +1326,13 @@ function renderStatus() {
   const g = t && t.group && groups.get(t.group);
   if (multiExec) items.push(h('span', { class: 'pill warn clickable', title: 'Desactivar', onclick: toggleMulti }, 'MULTI-EJECUCIÓN'));
   else if (g && g.multi) items.push(h('span', { class: 'pill warn clickable', title: 'Desactivar', onclick: () => toggleGroupMulti(g.id) }, `MULTI · ${g.name}`));
-  if (broadcastScope(t)) items.push(h('span', { class: 'pill warn clickable', title: 'Pegar en todas las terminales (Ctrl+Shift+U)', onclick: () => multiPaste() }, icon('paste', 11), ' MULTI-PEGADO'));
+  if (broadcastScope(t)) {
+    items.push(h('span', {
+      class: 'pill clickable ' + (S().pasteToAll ? 'warn' : 'muted'), onclick: togglePasteToAll,
+      title: S().pasteToAll ? 'Ctrl+V pega en todas las terminales de la multi-ejecución (clic: sólo en la activa)' : 'Ctrl+V pega sólo en la terminal activa (clic: en todas)',
+    }, `Ctrl+V: ${S().pasteToAll ? 'TODAS' : 'SÓLO ACTIVA'}`));
+    items.push(h('span', { class: 'pill warn clickable', title: 'Editar y pegar en todas las terminales (Ctrl+Shift+U)', onclick: () => multiPaste() }, icon('paste', 11), ' MULTI-PEGADO'));
+  }
   if (runningTunnels) items.push(h('span', { class: 'pill ok clickable', onclick: () => setPanel('tunnels') }, `${runningTunnels} túnel${runningTunnels > 1 ? 'es' : ''}`));
   items.push(h('span', { class: 'item' }, `${tabs.size} pestaña${tabs.size === 1 ? '' : 's'}`));
   items.push(h('span', { class: 'item clickable', onclick: openPalette }, icon('command', 12), 'Ctrl+Shift+P'));
@@ -2942,6 +2962,7 @@ function paletteCommands() {
     [multiExec ? 'Desactivar multi-ejecución' : 'Activar multi-ejecución', 'broadcast', toggleMulti, 'Ctrl+Shift+M'],
     [layout === 'grid' ? 'Vista en pestañas' : 'Vista en mosaico', 'grid', toggleLayout, 'Ctrl+Shift+L'],
     ['Multi-pegado: pegar en todas las terminales…', 'paste', () => multiPaste(), 'Ctrl+Shift+U'],
+    [S().pasteToAll ? 'Ctrl+V en multi-ejecución: pegar sólo en la activa' : 'Ctrl+V en multi-ejecución: pegar en todas', 'paste', togglePasteToAll, ''],
     ['Nuevo grupo de pestañas…', 'layers', () => groupDialog(null, activeId ? [activeId] : []), ''],
     ...LAYOUTS.map(([id, label, ic]) => [`Disposición: ${label}`, ic, () => setLayoutFor(id), '']),
     ['Mostrar/ocultar panel lateral', 'sidebar', toggleSidebar, 'Ctrl+Shift+B'],
