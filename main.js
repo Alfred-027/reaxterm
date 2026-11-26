@@ -1189,7 +1189,7 @@ function createWindow() {
     win.setAppDetails({ appId: APP_ID, appIconPath: ICON_ICO, appIconIndex: 0, relaunchCommand: `"${exe}"`, relaunchDisplayName: 'ReaXTerm' });
   }
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
-  win.once('ready-to-show', () => { if (!SMOKE) win.show(); });
+  win.once('ready-to-show', () => { if (!SMOKE) win.show(); else if (process.env.REAXTERM_SMOKE_SHOW) win.showInactive(); });
 
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:\/\//.test(url)) shell.openExternal(url);

@@ -75,6 +75,7 @@ const DEFAULT_SETTINGS = {
   lineHeight: 1.15, termTheme: 'reax', cursorStyle: 'bar', cursorBlink: true, scrollback: 10000, copyOnSelect: true,
   rightClickPaste: false, confirmClose: true, autoSftp: true, defaultShell: 'powershell', sidebarWidth: 290,
   sidebarOpen: true, openFolders: {}, folderStyles: {}, compactSessions: true, rdpMode: 'mstsc', sftpHidden: false, sftpFollow: false, webgl: true, pasteWarnLines: 5,
+  gridLayout: 'auto',
 };
 const DEFAULT_SNIPPETS = [
   ['Información del sistema', 'uname -a && cat /etc/os-release | head -n 4 && uptime'],
@@ -94,6 +95,7 @@ let activeId = null;
 let layout = 'tabs';     // 'tabs' | 'grid'
 let multiExec = false;
 let multiGrid = false;   // mosaico abierto automáticamente por la multi-ejecución
+const groups = new Map(); // id -> {id, name, layout, multi, last}: pestaña de grupo (sus miembros llevan t.group = id)
 let panel = 'sessions';
 let INFO = { shells: [], ptyAvailable: true };
 const tunnelState = {};  // id -> {state, text}
@@ -269,6 +271,9 @@ function openSession(s, opts = {}) {
     h('button', { class: 'icon-btn sm', onclick: () => closeSearch(t) }, icon('x', 14)));
   const pane = h('div', { class: 'pane', dataset: { id } },
     h('div', { class: 'pane-head' }, h('span', { class: 'dot' }), icon(TYPES[s.type].icon, 13), h('span', { class: 'title' }, sessionTitle(s)),
+      h('label', { class: 'pane-multi', title: 'Si está marcada, esta terminal recibe lo que se escribe en multi-ejecución' },
+        h('input', { type: 'checkbox', checked: true, onchange: (e) => setMulti(t, e.target.checked) }), icon('broadcast', 12), 'Multi'),
+      h('button', { class: 'icon-btn sm pane-ungroup', title: 'Sacar del grupo', onclick: (e) => { e.stopPropagation(); ungroupTab(id); } }, icon('layers', 13)),
       h('button', { class: 'icon-btn sm', title: 'Cerrar', onclick: (e) => { e.stopPropagation(); closeTab(id); } }, icon('x', 13))),
     termEl, searchBox,
     isFilesType(s.type) && h('div', { class: 'pane-files' }),
@@ -367,11 +372,7 @@ function bindTerminalInput(t) {
       return;
     }
     if (t.state !== 'connected') return;
-    const targets = multiExec && t.multi ? [...tabs.values()].filter((o) => o.state === 'connected' && o.multi) : [t];
-    for (const o of targets) {
-      rx.write(o.id, d);
-      if (d.includes('\r')) watchCwd(o);
-    }
+    for (const o of broadcastTargets(t)) sendInput(o, d);
   });
   term.onBinary((d) => rx.write(t.id, d));
   term.onResize(({ cols, rows }) => rx.resize(t.id, cols, rows));
@@ -385,10 +386,41 @@ function bindTerminalInput(t) {
   });
 }
 
+// Todo lo que se escribe en una terminal pasa por aquí (también la multi-ejecución y el multi-pegado)
+function sendInput(o, d) {
+  rx.write(o.id, d);
+  if (d.includes('\r')) watchCwd(o);
+}
+
+// Pestañas alcanzadas por la multi-ejecución en la que participa t: todas (multi-ejecución global) o las de su
+// grupo, si el grupo la tiene activada. null si no hay multi-ejecución para t.
+function broadcastScope(t) {
+  if (!t || noTerminal(t.session.type)) return null;
+  if (multiExec) return [...tabs.values()];
+  const g = t.group && groups.get(t.group);
+  return g && g.multi ? groupMembers(g.id) : null;
+}
+// A quién va lo que se escribe en t. Con anyway, aunque t esté excluida (comandos guardados, multi-pegado).
+function broadcastTargets(t, anyway = false) {
+  const scope = broadcastScope(t);
+  if (!scope || (!t.multi && !anyway)) return [t];
+  return scope.filter((o) => o.state === 'connected' && o.multi);
+}
+function isBroadcasting(t) { return !!(t.multi && t.state === 'connected' && broadcastScope(t)); }
+
+function setMulti(t, on) {
+  t.multi = on;
+  renderAll();
+}
+
 function terminalMenuItems(t) {
+  const scope = broadcastScope(t);
+  const g = t.group && groups.get(t.group);
+  const others = [...groups.values()].filter((x) => x.id !== t.group);
   return [
     { label: 'Copiar', icon: 'copy', hint: 'Ctrl+Shift+C', disabled: !t.term.hasSelection(), action: () => copySelection(t) },
     { label: 'Pegar', icon: 'download', hint: 'Ctrl+V', action: () => pasteInto(t) },
+    scope && { label: 'Multi-pegado (en todas las terminales)…', icon: 'paste', action: () => multiPaste(t) },
     { label: 'Seleccionar todo', icon: 'maximize', action: () => t.term.selectAll() },
     { label: 'Buscar…', icon: 'search', hint: 'Ctrl+Shift+F', action: () => openSearch(t) },
     { sep: true },
@@ -396,7 +428,13 @@ function terminalMenuItems(t) {
     { label: t.logging ? 'Detener registro de sesión' : 'Registrar sesión en archivo…', icon: 'record', action: () => toggleLog(t) },
     { label: 'Exportar contenido del búfer…', icon: 'export', action: () => exportBuffer(t) },
     { sep: true },
-    { label: t.multi ? 'Excluir de multi-ejecución' : 'Incluir en multi-ejecución', icon: 'broadcast', action: () => { t.multi = !t.multi; renderAll(); } },
+    { label: t.multi ? 'Excluir de multi-ejecución' : 'Incluir en multi-ejecución', icon: 'broadcast', action: () => setMulti(t, !t.multi) },
+    { sep: true },
+    !g && { label: 'Nuevo grupo con esta pestaña…', icon: 'layers', action: () => groupDialog(null, [t.id]) },
+    ...others.map((x) => ({ label: `Mover al grupo «${x.name}»`, icon: 'layers', action: () => addToGroup(x.id, t.id) })),
+    g && { label: 'Hacer principal en el grupo', icon: 'lyMainLeft', action: () => makeMain(t.id) },
+    g && { label: `Sacar del grupo «${g.name}»`, icon: 'layers', action: () => ungroupTab(t.id) },
+    { sep: true },
     { label: 'Duplicar pestaña', icon: 'copy', action: () => openSession(t.session) },
     { label: 'Reconectar', icon: 'refresh', action: () => reconnect(t) },
     { label: 'Cerrar pestaña', icon: 'x', danger: true, hint: 'Ctrl+Shift+W', action: () => closeTab(t.id) },
@@ -413,11 +451,53 @@ async function pasteInto(t) {
   if (!text) return;
   const lines = text.split(/\r?\n/).length;
   if (S().pasteWarnLines && lines > S().pasteWarnLines) {
-    const ok = await confirmBox('Pegar varias líneas', `Vas a pegar ${lines} líneas en «${t.title}»${multiExec ? ' y en las demás pestañas (multi-ejecución activa)' : ''}. Cada línea podría ejecutarse como comando.`, { okLabel: 'Pegar' });
+    const ok = await confirmBox('Pegar varias líneas', `Vas a pegar ${lines} líneas en «${t.title}»${isBroadcasting(t) ? ' y en las demás terminales de la multi-ejecución' : ''}. Cada línea podría ejecutarse como comando.`, { okLabel: 'Pegar' });
     if (!ok) return;
   }
   t.term.paste(text);
   t.term.focus();
+}
+
+// Pegado en todas las terminales de la multi-ejecución a la vez, incluida la activa aunque esté excluida
+// de lo que se escribe. Cada terminal recibe el texto como un pegado (con los marcadores de "bracketed paste"
+// si su programa los pidió), así un editor o el shell lo tratan igual que un Ctrl+V.
+async function multiPaste(t = tabs.get(activeId)) {
+  if (!t || !broadcastScope(t)) return toast('Activa la multi-ejecución (global o del grupo) para pegar en varias terminales', 'warn');
+  const targets = broadcastTargets(t, true);
+  if (!targets.length) return toast('No hay terminales conectadas en la multi-ejecución', 'warn');
+  const text = await api('clip:read').catch(() => '');
+  const area = h('textarea', { class: 'input mono', rows: 8, spellcheck: 'false', placeholder: 'Texto a pegar…' });
+  area.value = text || '';
+  const enter = h('input', { type: 'checkbox' });
+  const body = h('div', { 'data-noenter': '' },
+    h('div', { class: 'field' }, h('label', {}, `Se pegará en ${targets.length} terminal${targets.length === 1 ? '' : 'es'}:`),
+      h('div', { class: 'chips' }, targets.map((o) => h('span', { class: 'chip' }, h('span', { class: 'dot ' + o.state }), tabTitle(o))))),
+    h('div', { class: 'field' }, h('label', {}, 'Texto (tomado del portapapeles, puedes editarlo)'), area),
+    h('label', { class: 'check' }, enter, 'Enviar Enter al final'));
+  modal({
+    title: 'Multi-pegado', iconName: 'paste', width: 560, body,
+    actions: [{ label: 'Cancelar', ghost: true }, {
+      label: `Pegar en ${targets.length}`, primary: true, icon: 'paste', onClick: async () => {
+        const value = area.value;
+        if (!value) return false;
+        const lines = value.split(/\r?\n/).length;
+        if (S().pasteWarnLines && lines > S().pasteWarnLines && !await confirmBox('Pegar varias líneas', `Vas a pegar ${lines} líneas en ${targets.length} terminales. Cada línea podría ejecutarse como comando.`, { okLabel: 'Pegar' })) return false;
+        pasteToTargets(targets, value, enter.checked);
+        toast(`Pegado en ${targets.length} terminal${targets.length === 1 ? '' : 'es'}`, 'ok', 1600);
+        setTimeout(() => t.term.focus(), 50);
+      },
+    }],
+  });
+  setTimeout(() => { area.focus(); area.select(); }, 40);
+}
+
+function pasteToTargets(targets, text, enter = false) {
+  const body = text.replace(/\r?\n/g, '\r');
+  for (const o of targets) {
+    if (o.state !== 'connected') continue;
+    const bracketed = o.term.modes && o.term.modes.bracketedPasteMode;
+    sendInput(o, (bracketed ? '\x1b[200~' + body.replace(/\x1b\[20[01]~/g, '') + '\x1b[201~' : body) + (enter ? '\r' : ''));
+  }
 }
 
 function openSearch(t) { const box = t.el.querySelector('.term-search'); box.classList.add('open'); const i = box.querySelector('input'); i.focus(); i.select(); }
@@ -743,22 +823,27 @@ async function closeTab(id, { force = false } = {}) {
   sftp.delete(id);
   const idx = order.indexOf(id);
   order = order.filter((x) => x !== id);
-  if (activeId === id) activeId = order[Math.min(idx, order.length - 1)] || null;
+  // Dentro de un grupo, el foco pasa a otro miembro del mismo grupo
+  const mates = t.group ? groupMembers(t.group) : [];
+  if (t.group && !mates.length) groups.delete(t.group);
+  if (activeId === id) activeId = (mates[0] && mates[0].id) || order[Math.min(idx, order.length - 1)] || null;
   if (activeId) activate(activeId); else renderAll();
 }
 
 function activate(id) {
   activeId = id;
   const t = tabs.get(id);
-  if (t) { t.bell = false; }
+  if (t) { t.bell = false; if (t.group && groups.has(t.group)) groups.get(t.group).last = id; }
   renderAll();
   if (t) requestAnimationFrame(() => { if (!t.opened || noTerminal(t.session.type)) { if (t.rdp) t.rdp.el.focus(); return; } fitTab(t); if (!document.activeElement || !document.activeElement.closest('.modal, .side, .quick')) t.term.focus(); });
 }
 
+// Ctrl+Tab y Alt+número recorren las pestañas de la barra: un grupo cuenta como una sola
 function cycleTab(dir) {
-  if (!order.length) return;
-  const i = order.indexOf(activeId);
-  activate(order[(i + dir + order.length) % order.length]);
+  const entries = stripEntries();
+  if (!entries.length) return;
+  const i = entries.findIndex((e) => entryHas(e, activeId));
+  activateEntry(entries[(i + dir + entries.length) % entries.length]);
 }
 
 async function toggleLog(t) {
@@ -820,7 +905,246 @@ function toggleLayout() {
   multiGrid = false;
   layout = layout === 'tabs' ? 'grid' : 'tabs';
   renderAll();
-  setTimeout(() => { for (const t of tabs.values()) fitTab(t); }, 30);
+  refitAll();
+}
+
+function refitAll() { setTimeout(() => { for (const t of tabs.values()) fitTab(t); }, 30); }
+
+// ------------------------------------------------------------ disposiciones del mosaico
+const LAYOUTS = [
+  ['auto', 'Cuadrícula automática', 'grid'],
+  ['cols', 'Lado a lado (columnas)', 'lyCols'],
+  ['rows', 'Apiladas (filas)', 'lyRows'],
+  ['two', 'Dos columnas', 'lyTwo'],
+  ['main-left', 'Principal a la izquierda', 'lyMainLeft'],
+  ['main-top', 'Principal arriba', 'lyMainTop'],
+];
+const layoutIcon = (ly) => (LAYOUTS.find((l) => l[0] === ly) || LAYOUTS[0])[2];
+
+// Coloca los paneles visibles (els, en orden) según la disposición; el "principal" es el primero
+function applyGrid(terms, els, ly) {
+  const n = els.length;
+  const fr = (k) => `repeat(${Math.max(1, k)}, minmax(0, 1fr))`;
+  let cols, rows;
+  if (ly === 'cols') { cols = fr(n); rows = fr(1); }
+  else if (ly === 'rows') { cols = fr(1); rows = fr(n); }
+  else if (ly === 'two') { cols = fr(Math.min(2, n)); rows = fr(Math.ceil(n / 2)); }
+  else if (ly === 'main-left' && n > 1) {
+    cols = 'minmax(0, 2fr) minmax(0, 1fr)'; rows = fr(n - 1);
+    els[0].style.gridColumn = '1'; els[0].style.gridRow = `1 / span ${n - 1}`;
+  } else if (ly === 'main-top' && n > 1) {
+    cols = fr(n - 1); rows = 'minmax(0, 2fr) minmax(0, 1fr)';
+    els[0].style.gridRow = '1'; els[0].style.gridColumn = `1 / span ${n - 1}`;
+  } else { const c = Math.ceil(Math.sqrt(n)); cols = fr(c); rows = fr(Math.ceil(n / c)); }
+  terms.style.gridTemplateColumns = cols;
+  terms.style.gridTemplateRows = rows;
+}
+
+// Cambia la disposición de lo que se está viendo: el grupo activo o el mosaico general
+function setLayoutFor(ly, g = shownGroup()) {
+  if (g) g.layout = ly;
+  else {
+    S().gridLayout = ly;
+    save('settings');
+    if (layout === 'tabs') { layout = 'grid'; multiGrid = false; }
+  }
+  renderAll();
+  refitAll();
+}
+
+function layoutMenuAt(x, y, g = shownGroup()) {
+  const cur = g ? g.layout : (layout === 'grid' ? S().gridLayout || 'auto' : null);
+  showMenu(x, y, [
+    ...LAYOUTS.map(([id, label, ic]) => ({ label: (g ? 'Grupo: ' : 'Mosaico: ') + label, icon: cur === id ? 'check' : ic, action: () => setLayoutFor(id, g) })),
+    { sep: true },
+    { label: 'Nuevo grupo de pestañas…', icon: 'layers', action: () => groupDialog(null, []) },
+    g && { label: `Editar grupo «${g.name}»…`, icon: 'edit', action: () => groupDialog(g) },
+  ]);
+}
+function layoutMenu(e) { const r = e.currentTarget.getBoundingClientRect(); layoutMenuAt(r.left, r.bottom + 6); }
+
+// ------------------------------------------------------------ grupos de pestañas
+// Un grupo es una pestaña de la barra que muestra a sus miembros juntos, con su propia disposición y su
+// propia multi-ejecución. Los miembros siguen en `order` (contiguos); la pertenencia va en t.group.
+function groupMembers(gid) { return order.map((id) => tabs.get(id)).filter((t) => t && t.group === gid); }
+
+function stripEntries() {
+  const out = [];
+  const seen = new Set();
+  for (const id of order) {
+    const t = tabs.get(id);
+    const g = t.group && groups.get(t.group);
+    if (!g) out.push({ tab: t });
+    else if (!seen.has(g.id)) { seen.add(g.id); out.push({ group: g }); }
+  }
+  return out;
+}
+function entryHas(e, id) { const t = tabs.get(id); return e.tab ? e.tab.id === id : !!t && t.group === e.group.id; }
+function activateEntry(e) {
+  if (e.tab) return activate(e.tab.id);
+  const m = groupMembers(e.group.id);
+  if (m.length) activate((m.find((t) => t.id === e.group.last) || m[0]).id);
+}
+
+// Grupo que se está mostrando: vista en pestañas con la pestaña de un grupo activa
+function shownGroup() {
+  if (layout === 'grid') return null;
+  const t = tabs.get(activeId);
+  return (t && t.group && groups.get(t.group)) || null;
+}
+function visibleIds() {
+  if (layout === 'grid') return order;
+  const g = shownGroup();
+  if (g) return groupMembers(g.id).map((t) => t.id);
+  return activeId ? [activeId] : [];
+}
+
+// Deja juntos en `order` a los miembros de un grupo, donde estaba el primero
+function packGroup(gid) {
+  const isMember = (id) => tabs.get(id).group === gid;
+  const ids = order.filter(isMember);
+  if (!ids.length) return;
+  const pos = order.slice(0, order.indexOf(ids[0])).filter((id) => !isMember(id)).length;
+  const rest = order.filter((id) => !isMember(id));
+  rest.splice(pos, 0, ...ids);
+  order = rest;
+}
+function pruneGroups() { for (const gid of [...groups.keys()]) if (!groupMembers(gid).length) groups.delete(gid); }
+
+let groupSeq = 0;
+function createGroup(name, ids, { layout: ly = 'auto', multi = false } = {}) {
+  groupSeq++;
+  const g = { id: 'g' + uid(), name: name || `Grupo ${groupSeq}`, layout: ly, multi, last: ids[0] };
+  groups.set(g.id, g);
+  for (const id of ids) tabs.get(id).group = g.id;
+  packGroup(g.id);
+  pruneGroups();
+  return g;
+}
+
+function addToGroup(gid, id) {
+  const t = tabs.get(id);
+  if (!t || !groups.has(gid)) return;
+  const prev = shownGroup();
+  t.group = gid;
+  // va al final del grupo
+  order = order.filter((x) => x !== id);
+  const m = groupMembers(gid);
+  order.splice(m.length ? order.indexOf(m[m.length - 1].id) + 1 : order.length, 0, id);
+  pruneGroups();
+  if (prev && prev.id !== gid && groups.has(prev.id)) renderAll(); else activate(id);
+  refitAll();
+}
+
+// Saca una pestaña de su grupo sin cerrarla: queda suelta junto al grupo y se sigue viendo el grupo
+function ungroupTab(id) {
+  const t = tabs.get(id);
+  if (!t || !t.group) return;
+  const gid = t.group;
+  const m = groupMembers(gid);
+  t.group = null;
+  order = order.filter((x) => x !== id);
+  const rest = m.filter((x) => x.id !== id);
+  order.splice(rest.length ? order.indexOf(rest[rest.length - 1].id) + 1 : order.length, 0, id);
+  pruneGroups();
+  if (activeId === id && rest.length && layout === 'tabs') activate((rest.find((x) => x.id === groups.get(gid).last) || rest[0]).id);
+  else renderAll();
+  refitAll();
+}
+
+function makeMain(id) {
+  const t = tabs.get(id);
+  if (!t || !t.group) return;
+  const first = groupMembers(t.group)[0];
+  if (first.id === id) return;
+  order = order.filter((x) => x !== id);
+  order.splice(order.indexOf(first.id), 0, id);
+  renderAll();
+  refitAll();
+}
+
+function dissolveGroup(gid) {
+  for (const t of groupMembers(gid)) t.group = null;
+  groups.delete(gid);
+  renderAll();
+  refitAll();
+}
+
+async function closeGroup(gid) {
+  const g = groups.get(gid);
+  const m = groupMembers(gid);
+  if (!g) return;
+  if (S().confirmClose && m.some((t) => t.state === 'connected' && t.session.type !== 'local')
+    && !await confirmBox('Cerrar grupo', `¿Cerrar las ${m.length} sesiones del grupo «${g.name}»?`, { okLabel: 'Cerrar todas', danger: true })) return;
+  for (const t of m) await closeTab(t.id, { force: true });
+}
+
+function toggleGroupMulti(gid) {
+  const g = groups.get(gid);
+  if (!g) return;
+  g.multi = !g.multi;
+  toast(g.multi ? `Multi-ejecución en «${g.name}»: lo que escribas va a todas sus terminales marcadas` : `Multi-ejecución de «${g.name}» desactivada`, g.multi ? 'warn' : 'info');
+  renderAll();
+}
+
+function groupMenuItems(g, x, y) {
+  const term = groupMembers(g.id).find((t) => !noTerminal(t.session.type) && t.id === g.last) || groupMembers(g.id).find((t) => !noTerminal(t.session.type));
+  return [
+    { label: g.multi ? 'Desactivar multi-ejecución del grupo' : 'Activar multi-ejecución del grupo', icon: 'broadcast', action: () => toggleGroupMulti(g.id) },
+    (g.multi || multiExec) && term && { label: 'Multi-pegado en el grupo…', icon: 'paste', action: () => multiPaste(term) },
+    { label: 'Disposición…', icon: layoutIcon(g.layout), action: () => layoutMenuAt(x, y, g) },
+    { label: 'Editar grupo…', icon: 'edit', action: () => groupDialog(g) },
+    { label: 'Renombrar grupo', icon: 'edit', action: async () => { const n = await promptText('Renombrar grupo', 'Nombre', g.name); if (n) { g.name = n; renderAll(); } } },
+    { sep: true },
+    { label: 'Desagrupar (dejar las pestañas sueltas)', icon: 'layers', action: () => dissolveGroup(g.id) },
+    { label: 'Cerrar todas las sesiones del grupo', icon: 'x', danger: true, action: () => closeGroup(g.id) },
+  ];
+}
+
+// Crear o editar un grupo: nombre, disposición, miembros y multi-ejecución
+function groupDialog(g, preselect = []) {
+  if (!tabs.size) return toast('Abre algunas sesiones para poder agruparlas', 'info');
+  const name = h('input', { class: 'input', value: g ? g.name : `Grupo ${groupSeq + 1}`, autofocus: true });
+  let ly = g ? g.layout : 'auto';
+  const picks = h('div', { class: 'layout-pick' });
+  const drawPicks = () => picks.replaceChildren(...LAYOUTS.map(([id, label, ic]) =>
+    h('button', { class: 'icon-btn' + (ly === id ? ' on' : ''), type: 'button', title: label, onclick: () => { ly = id; drawPicks(); } }, icon(ic, 20))));
+  drawPicks();
+  const checks = new Map();
+  const list = h('div', { class: 'group-pick' }, order.map((id) => {
+    const t = tabs.get(id);
+    const other = t.group && t.group !== (g && g.id) && groups.get(t.group);
+    const cb = h('input', { type: 'checkbox', checked: g ? t.group === g.id : preselect.includes(id) });
+    checks.set(id, cb);
+    return h('label', { class: 'check' }, cb, h('span', { class: 'dot ' + t.state }), icon(TYPES[t.session.type].icon, 13), tabTitle(t),
+      other && h('span', { class: 'pick-note' }, `(ahora en «${other.name}»)`));
+  }));
+  const multi = h('input', { type: 'checkbox', checked: g ? g.multi : false });
+  modal({
+    title: g ? 'Editar grupo' : 'Nuevo grupo de pestañas', iconName: 'layers', width: 520,
+    body: h('div', {},
+      h('div', { class: 'field' }, h('label', {}, 'Nombre'), name),
+      h('div', { class: 'field' }, h('label', {}, 'Disposición'), picks),
+      h('div', { class: 'field' }, h('label', {}, 'Pestañas del grupo'), list),
+      h('label', { class: 'check' }, multi, 'Multi-ejecución en el grupo (lo escrito va a todas sus terminales; se puede excluir cada una)')),
+    actions: [{ label: 'Cancelar', ghost: true }, {
+      label: g ? 'Guardar' : 'Crear grupo', primary: true, onClick: () => {
+        const ids = order.filter((id) => checks.get(id) && checks.get(id).checked);
+        if (!ids.length) { toast('Marca al menos una pestaña', 'warn'); return false; }
+        let grp = g && groups.get(g.id);
+        if (grp) {
+          Object.assign(grp, { name: name.value.trim() || grp.name, layout: ly, multi: multi.checked });
+          for (const t of groupMembers(grp.id)) if (!ids.includes(t.id)) t.group = null;
+          for (const id of ids) tabs.get(id).group = grp.id;
+          packGroup(grp.id);
+          pruneGroups();
+        } else grp = createGroup(name.value.trim(), ids, { layout: ly, multi: multi.checked });
+        if (layout === 'grid') { layout = 'tabs'; multiGrid = false; }
+        if (groups.has(grp.id)) activateEntry({ group: grp }); else renderAll();
+        refitAll();
+      },
+    }],
+  });
 }
 
 // ============================================================ render general
@@ -840,7 +1164,9 @@ function renderTitleActions() {
     h('button', { class: 'icon-btn tip-down', 'data-tip': 'Nueva sesión (Ctrl+Shift+N)', onclick: () => editSession() }, icon('plus', 17)),
     h('button', { class: 'icon-btn tip-down', 'data-tip': 'Terminal local', onclick: (e) => shellMenu(e) }, icon('terminal', 17)),
     h('button', { class: 'icon-btn tip-down' + (multiExec ? ' warn-on' : ''), 'data-tip': 'Multi-ejecución (Ctrl+Shift+M)', onclick: toggleMulti }, icon('broadcast', 17)),
-    h('button', { class: 'icon-btn tip-down' + (layout === 'grid' ? ' on' : ''), 'data-tip': 'Vista en mosaico (Ctrl+Shift+L)', onclick: toggleLayout }, icon(layout === 'grid' ? 'tabs' : 'grid', 17)),
+    broadcastScope(tabs.get(activeId)) && h('button', { class: 'icon-btn tip-down warn-on', 'data-tip': 'Multi-pegado: pegar en todas las terminales (Ctrl+Shift+U)', onclick: () => multiPaste() }, icon('paste', 17)),
+    h('button', { class: 'icon-btn tip-down' + (layout === 'grid' ? ' on' : ''), 'data-tip': 'Vista en mosaico (Ctrl+Shift+L)', onclick: toggleLayout, oncontextmenu: (e) => { e.preventDefault(); layoutMenu(e); } }, icon(layout === 'grid' ? 'tabs' : 'grid', 17)),
+    h('button', { class: 'icon-btn tip-down' + (shownGroup() ? ' on' : ''), 'data-tip': 'Disposición del mosaico y grupos de pestañas', onclick: layoutMenu }, icon(shownGroup() ? layoutIcon(shownGroup().layout) : layoutIcon(S().gridLayout), 17)),
     h('button', { class: 'icon-btn tip-down', 'data-tip': 'Ajustes', onclick: () => openSettings() }, icon('settings', 17)),
   );
 }
@@ -852,11 +1178,60 @@ function shellMenu(e) {
 
 function tabTitle(t) { return t.renamed || t.title; }
 
+// Arrastrar en la barra: una pestaña sobre otra la reordena; sobre un grupo, la mete en él; un grupo se mueve entero
+function bindTabDrop(el, targetFirstId, targetGroup) {
+  el.addEventListener('dragover', (e) => {
+    if (e.dataTransfer.types.includes('text/x-tab') || e.dataTransfer.types.includes('text/x-group')) { e.preventDefault(); el.classList.add('dragover'); }
+  });
+  el.addEventListener('dragleave', () => el.classList.remove('dragover'));
+  el.addEventListener('drop', (e) => {
+    el.classList.remove('dragover');
+    const src = e.dataTransfer.getData('text/x-tab');
+    const srcGroup = e.dataTransfer.getData('text/x-group');
+    if (src && targetGroup) return addToGroup(targetGroup.id, src);
+    const moving = src ? [src] : srcGroup ? groupMembers(srcGroup).map((t) => t.id) : [];
+    if (!moving.length || moving.includes(targetFirstId)) return;
+    order = order.filter((x) => !moving.includes(x));
+    order.splice(order.indexOf(targetFirstId), 0, ...moving);
+    renderAll();
+  });
+}
+
+function groupTabEl(g) {
+  const ms = groupMembers(g.id);
+  const states = ms.map((t) => t.state);
+  const dot = states.includes('connected') ? 'connected' : states.includes('connecting') ? 'connecting' : states.includes('running') ? 'running' : 'closed';
+  const el = h('div', {
+    class: 'tab group' + (ms.some((t) => t.id === activeId) ? ' active' : '') + (g.multi ? ' multi' : ''), draggable: 'true',
+    title: `Grupo «${g.name}» (${ms.length})\n${ms.map((t) => '· ' + tabTitle(t)).join('\n')}`,
+    onclick: () => { if (layout === 'grid') { layout = 'tabs'; multiGrid = false; } activateEntry({ group: g }); refitAll(); },
+    onauxclick: (e) => { if (e.button === 1) closeGroup(g.id); },
+    ondblclick: () => groupDialog(g),
+    oncontextmenu: (e) => { e.preventDefault(); showMenu(e.clientX, e.clientY, groupMenuItems(g, e.clientX, e.clientY)); },
+  },
+  h('span', { class: 'dot ' + dot }),
+  icon('layers', 14),
+  h('span', { class: 'title' }, g.name),
+  h('span', { class: 'count' }, ms.length),
+  h('button', {
+    class: 'icon-btn sm bc' + (g.multi ? ' warn-on' : ''), title: g.multi ? 'Multi-ejecución del grupo activada (clic para desactivar)' : 'Activar multi-ejecución en el grupo',
+    onclick: (e) => { e.stopPropagation(); toggleGroupMulti(g.id); },
+  }, icon('broadcast', 12)),
+  h('button', { class: 'icon-btn sm close', title: 'Cerrar las sesiones del grupo', onclick: (e) => { e.stopPropagation(); closeGroup(g.id); } }, icon('x', 13)));
+  el.addEventListener('dragstart', (e) => { e.dataTransfer.setData('text/x-group', g.id); });
+  bindTabDrop(el, ms[0].id, g);
+  return el;
+}
+
+let tabsScrolledTo = null;
 function renderTabs() {
   const box = $('#tabs');
-  box.replaceChildren(...order.map((id) => {
-    const t = tabs.get(id);
+  box.replaceChildren(...stripEntries().map(({ tab, group }) => {
+    if (group) return groupTabEl(group);
+    const t = tab;
+    const id = t.id;
     const color = t.session.color;
+    const scope = broadcastScope(t);
     const el = h('div', {
       class: 'tab' + (id === activeId ? ' active' : ''), draggable: 'true', title: `${tabTitle(t)}\n${t.statusText || ''}`,
       onclick: () => activate(id),
@@ -868,42 +1243,55 @@ function renderTabs() {
     h('span', { class: 'dot ' + t.state }),
     icon(TYPES[t.session.type].icon, 14),
     h('span', { class: 'title' }, (t.bell ? '🔔 ' : '') + tabTitle(t)),
-    multiExec && t.multi && t.state === 'connected' ? h('span', { style: { color: 'var(--warn)' } }, icon('broadcast', 12)) : null,
+    // Con multi-ejecución, el icono de la pestaña la incluye o la excluye al vuelo
+    scope && t.state === 'connected' ? h('button', {
+      class: 'icon-btn sm bc' + (t.multi ? ' warn-on' : ' off'),
+      title: t.multi ? 'Recibe la multi-ejecución (clic para excluirla)' : 'Excluida de la multi-ejecución (clic para incluirla)',
+      onclick: (e) => { e.stopPropagation(); setMulti(t, !t.multi); },
+    }, icon('broadcast', 12)) : null,
     t.logging ? h('span', { style: { color: 'var(--err)' }, title: 'Registrando' }, icon('record', 12)) : null,
     h('button', { class: 'icon-btn sm close', onclick: (e) => { e.stopPropagation(); closeTab(id); } }, icon('x', 13)));
     el.addEventListener('dragstart', (e) => { e.dataTransfer.setData('text/x-tab', id); });
-    el.addEventListener('dragover', (e) => { if (e.dataTransfer.types.includes('text/x-tab')) { e.preventDefault(); el.classList.add('dragover'); } });
-    el.addEventListener('dragleave', () => el.classList.remove('dragover'));
-    el.addEventListener('drop', (e) => {
-      const src = e.dataTransfer.getData('text/x-tab');
-      el.classList.remove('dragover');
-      if (!src || src === id) return;
-      order = order.filter((x) => x !== src);
-      order.splice(order.indexOf(id), 0, src);
-      renderAll();
-    });
+    bindTabDrop(el, id, null);
     return el;
   }));
+  // Mostrar la pestaña activa sólo cuando cambia, para no deshacer el desplazamiento que haga el usuario
   const act = box.querySelector('.tab.active');
-  if (act) act.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  if (act && tabsScrolledTo !== activeId) { tabsScrolledTo = activeId; act.scrollIntoView({ block: 'nearest', inline: 'nearest' }); }
+  updateTabScroll();
 }
+
+// Barra de pestañas con muchas pestañas: rueda del ratón = desplazamiento horizontal, y flechas ‹ › a los lados
+function updateTabScroll() {
+  const box = $('#tabs');
+  const over = box.scrollWidth > box.clientWidth + 1;
+  $('#tabbar').classList.toggle('overflow', over);
+  $('#tabPrev').disabled = !over || box.scrollLeft <= 0;
+  $('#tabNext').disabled = !over || box.scrollLeft + box.clientWidth >= box.scrollWidth - 1;
+}
+function scrollTabs(dx, smooth = true) { $('#tabs').scrollBy({ left: dx, behavior: smooth ? 'smooth' : 'auto' }); }
 
 function renderPanes() {
   const terms = $('#terms');
-  terms.classList.toggle('grid', layout === 'grid' && order.length > 1);
-  if (layout === 'grid' && order.length > 1) {
-    const cols = Math.ceil(Math.sqrt(order.length));
-    terms.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
-    terms.style.gridTemplateRows = `repeat(${Math.ceil(order.length / cols)}, minmax(0, 1fr))`;
-  } else { terms.style.gridTemplateColumns = ''; terms.style.gridTemplateRows = ''; }
+  const ids = visibleIds();
+  const g = shownGroup();
+  const tiled = (layout === 'grid' && order.length > 1) || !!g;
+  terms.classList.toggle('grid', tiled);
+  terms.classList.toggle('group', !!g);
+  for (const id of order) { const el = tabs.get(id).el; el.style.gridColumn = ''; el.style.gridRow = ''; }
+  if (tiled) applyGrid(terms, ids.map((id) => tabs.get(id).el), g ? g.layout : S().gridLayout || 'auto');
+  else { terms.style.gridTemplateColumns = ''; terms.style.gridTemplateRows = ''; }
   // Reordenar sólo si cambió: mover un nodo del DOM le quita el foco a la terminal
   const current = [...terms.children].map((el) => el.dataset.id);
   if (current.join() !== order.join()) for (const id of order) terms.append(tabs.get(id).el);
   for (const id of order) {
     const t = tabs.get(id);
-    t.el.classList.toggle('visible', layout === 'grid' || id === activeId);
+    t.el.classList.toggle('visible', ids.includes(id));
     t.el.classList.toggle('active', id === activeId);
-    t.el.classList.toggle('multi', multiExec && t.multi && t.state === 'connected');
+    t.el.classList.toggle('multi', isBroadcasting(t));
+    t.el.classList.toggle('can-multi', !!broadcastScope(t));
+    t.el.classList.toggle('grouped', !!t.group);
+    t.el.querySelector('.pane-multi input').checked = t.multi;
     if (isFilesType(t.session.type)) renderFilesPane(t);
     t.el.querySelector('.pane-head .dot').className = 'dot ' + t.state;
     t.el.querySelector('.pane-head .title').textContent = tabTitle(t);
@@ -921,7 +1309,10 @@ function renderStatus() {
     if (t.logging) items.push(h('span', { class: 'item', style: { color: 'var(--err)' } }, icon('record', 12), 'Registrando'));
   } else items.push(h('span', { class: 'item' }, 'Listo'));
   items.push(h('span', { class: 'spacer' }));
-  if (multiExec) items.push(h('span', { class: 'pill warn clickable', onclick: toggleMulti }, 'MULTI-EJECUCIÓN'));
+  const g = t && t.group && groups.get(t.group);
+  if (multiExec) items.push(h('span', { class: 'pill warn clickable', title: 'Desactivar', onclick: toggleMulti }, 'MULTI-EJECUCIÓN'));
+  else if (g && g.multi) items.push(h('span', { class: 'pill warn clickable', title: 'Desactivar', onclick: () => toggleGroupMulti(g.id) }, `MULTI · ${g.name}`));
+  if (broadcastScope(t)) items.push(h('span', { class: 'pill warn clickable', title: 'Pegar en todas las terminales (Ctrl+Shift+U)', onclick: () => multiPaste() }, icon('paste', 11), ' MULTI-PEGADO'));
   if (runningTunnels) items.push(h('span', { class: 'pill ok clickable', onclick: () => setPanel('tunnels') }, `${runningTunnels} túnel${runningTunnels > 1 ? 'es' : ''}`));
   items.push(h('span', { class: 'item' }, `${tabs.size} pestaña${tabs.size === 1 ? '' : 's'}`));
   items.push(h('span', { class: 'item clickable', onclick: openPalette }, icon('command', 12), 'Ctrl+Shift+P'));
@@ -2235,8 +2626,7 @@ function sendSnippet(sn) {
   const t = tabs.get(activeId);
   if (!t || t.state !== 'connected') return toast('No hay ninguna terminal conectada activa', 'warn');
   const text = sn.command.replace(/\r?\n/g, '\r') + (sn.enter ? '\r' : '');
-  const targets = multiExec ? [...tabs.values()].filter((x) => x.state === 'connected' && x.multi) : [t];
-  for (const x of targets) rx.write(x.id, text);
+  for (const x of broadcastTargets(t, true)) sendInput(x, text);
   t.term.focus();
 }
 
@@ -2248,7 +2638,7 @@ function snippetsPanel() {
   const body = h('div', { class: 'side-body' }, list.map((sn) => h('div', { class: 'item-card', ondblclick: () => sendSnippet(sn) },
     h('div', { class: 'top' }, icon('code', 14), h('span', { class: 'name' }, sn.name),
       h('div', { class: 'acts' },
-        h('button', { class: 'icon-btn sm', title: multiExec ? 'Enviar a todas las pestañas' : 'Enviar a la terminal activa', onclick: () => sendSnippet(sn) }, icon('play', 14)),
+        h('button', { class: 'icon-btn sm', title: broadcastScope(tabs.get(activeId)) ? 'Enviar a todas las terminales de la multi-ejecución' : 'Enviar a la terminal activa', onclick: () => sendSnippet(sn) }, icon('play', 14)),
         h('button', { class: 'icon-btn sm', title: 'Copiar', onclick: () => api('clip:write', sn.command).then(() => toast('Copiado', 'ok', 1200)) }, icon('copy', 14)),
         h('button', { class: 'icon-btn sm', title: 'Editar', onclick: () => editSnippet(sn) }, icon('edit', 14)))),
     h('div', { class: 'desc' }, sn.command.split('\n')[0]))),
@@ -2551,6 +2941,9 @@ function paletteCommands() {
     ...INFO.shells.map((s) => [`Abrir ${s.label}`, 'terminal', () => newLocal(s.id), '']),
     [multiExec ? 'Desactivar multi-ejecución' : 'Activar multi-ejecución', 'broadcast', toggleMulti, 'Ctrl+Shift+M'],
     [layout === 'grid' ? 'Vista en pestañas' : 'Vista en mosaico', 'grid', toggleLayout, 'Ctrl+Shift+L'],
+    ['Multi-pegado: pegar en todas las terminales…', 'paste', () => multiPaste(), 'Ctrl+Shift+U'],
+    ['Nuevo grupo de pestañas…', 'layers', () => groupDialog(null, activeId ? [activeId] : []), ''],
+    ...LAYOUTS.map(([id, label, ic]) => [`Disposición: ${label}`, ic, () => setLayoutFor(id), '']),
     ['Mostrar/ocultar panel lateral', 'sidebar', toggleSidebar, 'Ctrl+Shift+B'],
     ['Credenciales', 'key', () => setPanel('credentials'), ''],
     ['Nueva credencial…', 'key', () => editCredential(), ''],
@@ -2748,7 +3141,7 @@ function openSettings(page = 'appearance') {
 
 // ============================================================ atajos globales
 function isGlobalShortcut(e) {
-  return (e.ctrlKey && e.shiftKey && ['KeyT', 'KeyW', 'KeyN', 'KeyM', 'KeyL', 'KeyP', 'KeyB'].includes(e.code))
+  return (e.ctrlKey && e.shiftKey && ['KeyT', 'KeyW', 'KeyN', 'KeyM', 'KeyL', 'KeyP', 'KeyB', 'KeyU'].includes(e.code))
     || (e.ctrlKey && e.code === 'Tab')
     || (e.altKey && !e.ctrlKey && /^Digit[1-9]$/.test(e.code))
     || (e.ctrlKey && !e.shiftKey && ['Equal', 'Minus', 'Digit0', 'NumpadAdd', 'NumpadSubtract'].includes(e.code))
@@ -2773,21 +3166,50 @@ document.addEventListener('keydown', (e) => {
     else if (c === 'KeyW') { if (activeId) closeTab(activeId); }
     else if (c === 'KeyN') editSession();
     else if (c === 'KeyM') toggleMulti();
+    else if (c === 'KeyU') multiPaste();
     else if (c === 'KeyL') toggleLayout();
     else if (c === 'KeyP') openPalette();
     else if (c === 'KeyB') toggleSidebar();
     else if (c === 'Tab') cycleTab(-1);
   } else if (e.ctrlKey && c === 'Tab') cycleTab(1);
-  else if (e.altKey && /^Digit/.test(c)) { const id = order[Number(c.slice(5)) - 1]; if (id) activate(id); }
+  else if (e.altKey && /^Digit/.test(c)) { const en = stripEntries()[Number(c.slice(5)) - 1]; if (en) activateEntry(en); }
   else if (e.ctrlKey && (c === 'Equal' || c === 'NumpadAdd')) zoom(1);
   else if (e.ctrlKey && (c === 'Minus' || c === 'NumpadSubtract')) zoom(-1);
   else if (e.ctrlKey && c === 'Digit0') zoom(0);
   else if (c === 'F11') api('app:fullscreen');
 });
 
+// Ctrl+rueda: zoom inmediato en cualquier posición. Se atiende en la fase de captura, antes que la terminal:
+// si no, xterm usa la rueda para desplazarse y el zoom sólo funcionaba al principio o al final del historial.
 document.addEventListener('wheel', (e) => {
-  if (e.ctrlKey && e.target.closest('.pane-term')) { e.preventDefault(); zoom(e.deltaY < 0 ? 1 : -1); }
-}, { passive: false });
+  if (!e.ctrlKey || !e.target.closest('.pane-term') || !e.deltaY) return;
+  e.preventDefault();
+  e.stopPropagation();
+  zoom(e.deltaY < 0 ? 1 : -1);
+}, { passive: false, capture: true });
+
+// Barra de pestañas: la rueda vertical la desplaza en horizontal
+(function initTabScroll() {
+  const box = $('#tabs');
+  box.addEventListener('wheel', (e) => {
+    if (box.scrollWidth <= box.clientWidth) return;
+    e.preventDefault();
+    box.scrollLeft += Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+  }, { passive: false });
+  box.addEventListener('scroll', updateTabScroll);
+  new ResizeObserver(updateTabScroll).observe(box);
+  $('#tabPrev').append(icon('chevronLeft', 15));
+  $('#tabNext').append(icon('chevron', 15));
+  $('#tabPrev').addEventListener('click', () => scrollTabs(-Math.max(160, box.clientWidth * 0.7)));
+  $('#tabNext').addEventListener('click', () => scrollTabs(Math.max(160, box.clientWidth * 0.7)));
+  $('#tabList').append(icon('chevronDown', 15));
+  $('#tabList').addEventListener('click', (e) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    showMenu(r.left, r.bottom + 4, stripEntries().map((en) => en.group
+      ? { label: `${en.group.name} (${groupMembers(en.group.id).length})`, icon: entryHas(en, activeId) ? 'check' : 'layers', action: () => activateEntry(en) }
+      : { label: tabTitle(en.tab), icon: en.tab.id === activeId ? 'check' : TYPES[en.tab.session.type].icon, action: () => activateEntry(en) }));
+  });
+})();
 
 // Cierre de la ventana con conexiones abiertas
 rx.on('app:request-close', async (count) => {
