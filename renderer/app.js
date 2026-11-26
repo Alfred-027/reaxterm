@@ -338,6 +338,7 @@ function openSession(s, opts = {}) {
   pane.addEventListener('mousedown', () => { if (activeId !== id) activate(id); });
   bindTerminalInput(t);
   bindDrop(t, pane);
+  bindPaneDrag(t, pane);
   new ResizeObserver(debounce(() => fitTab(t), 40)).observe(termEl);
 
   activate(id);
@@ -417,6 +418,7 @@ function terminalMenuItems(t) {
   const scope = broadcastScope(t);
   const g = t.group && groups.get(t.group);
   const others = [...groups.values()].filter((x) => x.id !== t.group);
+  const tiled = visibleIds();
   return [
     { label: 'Copiar', icon: 'copy', hint: 'Ctrl+Shift+C', disabled: !t.term.hasSelection(), action: () => copySelection(t) },
     { label: 'Pegar', icon: 'download', hint: 'Ctrl+V', action: () => pasteInto(t) },
@@ -432,7 +434,8 @@ function terminalMenuItems(t) {
     { sep: true },
     !g && { label: 'Nuevo grupo con esta pestaña…', icon: 'layers', action: () => groupDialog(null, [t.id]) },
     ...others.map((x) => ({ label: `Mover al grupo «${x.name}»`, icon: 'layers', action: () => addToGroup(x.id, t.id) })),
-    g && { label: 'Hacer principal en el grupo', icon: 'lyMainLeft', action: () => makeMain(t.id) },
+    tiled.length > 1 && tiled.includes(t.id) && tiled[0] !== t.id && { label: g && shownGroup() === g ? 'Hacer principal en el grupo' : 'Hacer principal en el mosaico', icon: 'lyMainLeft', action: () => makeMain(t.id) },
+    tiled.length > 1 && tiled.includes(t.id) && hasCustomTiles() && { label: 'Restablecer orden de los paneles', icon: 'refresh', action: () => setTiles(null) },
     g && { label: `Sacar del grupo «${g.name}»`, icon: 'layers', action: () => ungroupTab(t.id) },
     { sep: true },
     { label: 'Duplicar pestaña', icon: 'copy', action: () => openSession(t.session) },
@@ -885,6 +888,30 @@ async function launchRdp(s) {
   try { await api('launch:rdp', s); toast(`Abriendo escritorio remoto: ${s.host}`, 'ok'); } catch (e) { toast(e.message, 'error'); }
 }
 
+// Arrastrar un panel por su título sobre otro, en el mosaico o en un grupo, cambia su lugar
+const DRAG_PANE = 'text/x-pane';
+function bindPaneDrag(t, pane) {
+  const head = pane.querySelector('.pane-head');
+  const clear = () => document.querySelectorAll('.pane.pane-over, .pane.pane-dragging').forEach((el) => el.classList.remove('pane-over', 'pane-dragging'));
+  head.addEventListener('dragstart', (e) => {
+    e.dataTransfer.setData(DRAG_PANE, t.id);
+    e.dataTransfer.effectAllowed = 'move';
+    pane.classList.add('pane-dragging');
+  });
+  head.addEventListener('dragend', clear);
+  let depth = 0;
+  const isPane = (e) => e.dataTransfer.types.includes(DRAG_PANE);
+  pane.addEventListener('dragenter', (e) => { if (isPane(e) && pane.classList.contains('visible')) { depth++; pane.classList.add('pane-over'); } });
+  pane.addEventListener('dragleave', (e) => { if (isPane(e) && --depth <= 0) { depth = 0; pane.classList.remove('pane-over'); } });
+  pane.addEventListener('drop', (e) => {
+    if (!isPane(e)) return;
+    e.preventDefault();
+    depth = 0;
+    clear();
+    movePane(e.dataTransfer.getData(DRAG_PANE), t.id);
+  });
+}
+
 // Arrastrar archivos del explorador a la terminal => subida SFTP
 function bindDrop(t, pane) {
   let depth = 0;
@@ -970,6 +997,7 @@ function layoutMenuAt(x, y, g = shownGroup()) {
   showMenu(x, y, [
     ...LAYOUTS.map(([id, label, ic]) => ({ label: (g ? 'Grupo: ' : 'Mosaico: ') + label, icon: cur === id ? 'check' : ic, action: () => setLayoutFor(id, g) })),
     { sep: true },
+    (g || layout === 'grid') && hasCustomTiles(g) && { label: 'Restablecer orden de los paneles (como las pestañas)', icon: 'refresh', action: () => setTiles(null, g) },
     { label: 'Nuevo grupo de pestañas…', icon: 'layers', action: () => groupDialog(null, []) },
     g && { label: `Editar grupo «${g.name}»…`, icon: 'edit', action: () => groupDialog(g) },
   ]);
@@ -1006,10 +1034,40 @@ function shownGroup() {
   return (t && t.group && groups.get(t.group)) || null;
 }
 function visibleIds() {
-  if (layout === 'grid') return order;
+  if (layout === 'grid') return arrange(order, tileOrder);
   const g = shownGroup();
-  if (g) return groupMembers(g.id).map((t) => t.id);
+  if (g) return arrange(groupMembers(g.id).map((t) => t.id), g.tiles);
   return activeId ? [activeId] : [];
+}
+
+// Orden de los paneles del mosaico y de cada grupo: por omisión, el de las pestañas. Al arrastrar el título
+// de un panel se fija un orden propio (tileOrder para el mosaico, g.tiles para cada grupo), que no toca la barra.
+// Las pestañas nuevas se agregan al final.
+let tileOrder = null;
+function arrange(base, custom) {
+  if (!custom) return [...base];
+  const out = custom.filter((id) => base.includes(id));
+  for (const id of base) if (!out.includes(id)) out.push(id);
+  return out;
+}
+function setTiles(ids, g = shownGroup()) {
+  if (g) g.tiles = ids; else tileOrder = ids;
+  renderAll();
+  refitAll();
+}
+function hasCustomTiles(g = shownGroup()) {
+  const base = g ? groupMembers(g.id).map((t) => t.id) : order;
+  return arrange(base, g ? g.tiles : tileOrder).join() !== base.join();
+}
+// Suelta el panel src sobre el panel dst: src pasa a ocupar el lugar de dst
+function movePane(src, dst) {
+  const ids = visibleIds();
+  const from = ids.indexOf(src);
+  const to = ids.indexOf(dst);
+  if (from < 0 || to < 0 || from === to) return;
+  ids.splice(from, 1);
+  ids.splice(to, 0, src);
+  setTiles(ids);
 }
 
 // Deja juntos en `order` a los miembros de un grupo, donde estaba el primero
@@ -1065,15 +1123,11 @@ function ungroupTab(id) {
   refitAll();
 }
 
+// El principal es el primer panel de lo que se está viendo (grupo o mosaico)
 function makeMain(id) {
-  const t = tabs.get(id);
-  if (!t || !t.group) return;
-  const first = groupMembers(t.group)[0];
-  if (first.id === id) return;
-  order = order.filter((x) => x !== id);
-  order.splice(order.indexOf(first.id), 0, id);
-  renderAll();
-  refitAll();
+  const ids = visibleIds();
+  if (ids.length < 2 || !ids.includes(id) || ids[0] === id) return;
+  setTiles([id, ...ids.filter((x) => x !== id)]);
 }
 
 function dissolveGroup(gid) {
@@ -1292,7 +1346,8 @@ function renderPanes() {
   const tiled = (layout === 'grid' && order.length > 1) || !!g;
   terms.classList.toggle('grid', tiled);
   terms.classList.toggle('group', !!g);
-  for (const id of order) { const el = tabs.get(id).el; el.style.gridColumn = ''; el.style.gridRow = ''; }
+  for (const id of order) { const el = tabs.get(id).el; el.style.gridColumn = ''; el.style.gridRow = ''; el.style.order = ''; }
+  ids.forEach((id, i) => { tabs.get(id).el.style.order = i; });
   if (tiled) applyGrid(terms, ids.map((id) => tabs.get(id).el), g ? g.layout : S().gridLayout || 'auto');
   else { terms.style.gridTemplateColumns = ''; terms.style.gridTemplateRows = ''; }
   // Reordenar sólo si cambió: mover un nodo del DOM le quita el foco a la terminal
@@ -1306,6 +1361,7 @@ function renderPanes() {
     t.el.classList.toggle('can-multi', !!broadcastScope(t));
     t.el.classList.toggle('grouped', !!t.group);
     t.el.querySelector('.pane-multi input').checked = t.multi;
+    t.el.querySelector('.pane-head').draggable = tiled && ids.length > 1;
     if (isFilesType(t.session.type)) renderFilesPane(t);
     t.el.querySelector('.pane-head .dot').className = 'dot ' + t.state;
     t.el.querySelector('.pane-head .title').textContent = tabTitle(t);
